@@ -4,14 +4,14 @@ $LOAD_PATH.unshift(lib) unless $LOAD_PATH.include?(lib)
 require 'sidekiq/batch/version'
 
 Gem::Specification.new do |spec|
-  spec.name          = "sidekiq-batch"
+  spec.name          = "sidekiq-dags"
   spec.version       = Sidekiq::Batch::VERSION
-  spec.authors       = ["Marcin Naglik"]
-  spec.email         = ["marcin.naglik@gmail.com"]
+  spec.authors       = ["Oleg Orlov"]
+  spec.email         = ["orelcokolov@gmail.com"]
 
-  spec.summary       = "Sidekiq Batch Jobs"
-  spec.description   = "Sidekiq Batch Jobs Implementation"
-  spec.homepage      = "http://github.com/breamware/sidekiq-batch"
+  spec.summary       = "DAGs for Sidekiq"
+  spec.description   = "Sidekiq DAGs implementation base on open-source Sidekiq::Batch"
+  spec.homepage      = "http://github.com/orelsokolov/sidekiq-dags"
   spec.license       = "MIT"
 
   spec.files         = `git ls-files -z`.split("\x0").reject { |f| f.match(%r{^(test|spec|features)/}) }

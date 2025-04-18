@@ -7,6 +7,9 @@ require 'sidekiq/batch/status'
 require 'sidekiq/batch/final_status_snapshot'
 require 'sidekiq/batch/version'
 
+require 'sidekiq/node'
+require 'sidekiq/node_dsl'
+
 module Sidekiq
   class Batch
     class NoBlockGivenError < StandardError; end
