@@ -10,7 +10,7 @@ Simple Sidekiq DAGs implementation. Based on `sidekiq-batch` gem
 Add this line to your application's Gemfile:
 
 ```ruby
-gem 'sidekiq-dags'
+gem 'sidekiq-dags', github: 'OrelSokolov/sidekiq-dags'
 ```
 
 And then execute:

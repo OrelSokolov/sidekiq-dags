@@ -22,6 +22,7 @@ Gem::Specification.new do |spec|
   spec.required_ruby_version = ">= 3.2.0"
 
   spec.add_dependency "sidekiq", ">= 8", "< 9"
+  spec.add_dependency "colorize"
 
   spec.add_development_dependency "bundler", "~> 2.1"
   spec.add_development_dependency "rake", "~> 13.0"
