@@ -4,11 +4,15 @@ module Sidekiq
       class Worker
         include Sidekiq::Worker
 
-        def perform(clazz, event, opts, bid, parent_bid)
+        def perform(clazz, event, opts, bid, parent_bid, serialized_status)
           return unless %w(success complete).include?(event)
           clazz, method = clazz.split("#") if (clazz && clazz.class == String && clazz.include?("#"))
           method = "on_#{event}" if method.nil?
-          status = Sidekiq::Batch::Status.new(bid)
+          status = Sidekiq::Batch::FinalStatusSnapshot.deserialize(serialized_status)
+          estatus = Sidekiq::Batch::ExplicitStatus.new(bid)
+
+          Sidekiq.logger.info("Perform callback status exusts? #{estatus.exists?}".colorize(:magenta))
+          Sidekiq.logger.info("#{status.data}".colorize(:magenta))
 
           if clazz && object = Object.const_get(clazz)
             instance = object.new
@@ -24,7 +28,7 @@ module Sidekiq
           event = opts["event"].to_sym
           callback_batch = bid != callback_bid
 
-          Sidekiq.logger.debug {"Finalize #{event} batch id: #{opts["bid"]}, callback batch id: #{callback_bid} callback_batch #{callback_batch}"}
+          Sidekiq.logger.info {"Finalize #{event} batch id: #{opts["bid"]}, callback batch id: #{callback_bid} callback_batch #{callback_batch}"}
 
           batch_status = Status.new bid
           send(event, bid, batch_status, batch_status.parent_bid)

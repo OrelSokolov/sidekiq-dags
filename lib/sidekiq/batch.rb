@@ -4,6 +4,7 @@ require 'sidekiq'
 require 'sidekiq/batch/callback'
 require 'sidekiq/batch/middleware'
 require 'sidekiq/batch/status'
+require 'sidekiq/batch/final_status_snapshot'
 require 'sidekiq/batch/version'
 
 module Sidekiq
@@ -220,6 +221,8 @@ module Sidekiq
       end
 
       def process_successful_job(bid, jid)
+        Sidekiq.logger.info "PENDING: #{Sidekiq.redis { |r| r.hget("BID-#{bid}", 'pending')} } ".colorize(:light_yellow)
+
         failed, pending, children, complete, success, total, parent_bid = Sidekiq.redis do |r|
           r.multi do |pipeline|
             pipeline.scard("BID-#{bid}-failed")
@@ -245,6 +248,10 @@ module Sidekiq
       end
 
       def enqueue_callbacks(event, bid)
+        Sidekiq.logger.info "ENQUEUE CALLBACKS FOR #{event} #{bid}".colorize(:light_green)
+        estatus = Sidekiq::Batch::ExplicitStatus.new(bid)
+        Sidekiq.logger.info "status for #{bid} exists? #{estatus.exists?}"
+
         event_name = event.to_s
         batch_key = "BID-#{bid}"
         callback_key = "#{batch_key}-callbacks-#{event_name}"
@@ -265,7 +272,8 @@ module Sidekiq
         parent_bid = !parent_bid || parent_bid.empty? ? nil : parent_bid    # Basically parent_bid.blank?
         callback_args = callbacks.reduce([]) do |memo, jcb|
           cb = Sidekiq.load_json(jcb)
-          memo << [cb['callback'], event_name, cb['opts'], bid, parent_bid]
+          serialized_status = Sidekiq::Batch::FinalStatusSnapshot.new(bid).serialized
+          memo << [cb['callback'], event_name, cb['opts'], bid, parent_bid, serialized_status]
         end
 
         opts = {"bid" => bid, "event" => event_name}
@@ -305,7 +313,7 @@ module Sidekiq
       end
 
       def cleanup_redis(bid)
-        Sidekiq.logger.debug {"Cleaning redis of batch #{bid}"}
+        Sidekiq.logger.info {"Cleaning redis of batch #{bid}".colorize(:red) }
         Sidekiq.redis do |r|
           r.del(
             "BID-#{bid}",
