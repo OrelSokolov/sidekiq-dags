@@ -97,7 +97,41 @@ module Sidekiq
           Thread.current[:parent_bid] = nil
         end
 
-        return [] if @queued_jids.size == 0
+        # Если batch пустой (0 джобов), нужно установить pending=0 и total=0,
+        # и вызвать callbacks, если они есть
+        if @queued_jids.size == 0
+          # Получаем parent_bid из Redis, так как он может быть установлен при инициализации
+          stored_parent_bid = Sidekiq.redis { |r| r.hget(@bidkey, "parent_bid") }
+          stored_parent_bid = nil if stored_parent_bid && stored_parent_bid.empty?
+          
+          # Устанавливаем pending=0 и total=0 для пустого батча
+          Sidekiq.redis do |r|
+            r.multi do |pipeline|
+              pipeline.hset(@bidkey, "pending", "0")
+              pipeline.hset(@bidkey, "total", "0")
+              pipeline.expire(@bidkey, BID_EXPIRE_TTL)
+              
+              if stored_parent_bid
+                pipeline.expire("BID-#{stored_parent_bid}", BID_EXPIRE_TTL)
+              end
+            end
+          end
+          
+          # Проверяем, есть ли callbacks для этого батча
+          has_complete_callback = Sidekiq.redis { |r| r.scard("#{@bidkey}-callbacks-complete") } > 0
+          has_success_callback = Sidekiq.redis { |r| r.scard("#{@bidkey}-callbacks-success") } > 0
+          
+          # Если есть callbacks, вызываем их
+          # Для пустого батча без ошибок: complete и success вызываются одновременно
+          if has_complete_callback || has_success_callback
+            Sidekiq.logger.info "Empty batch #{@bid} has callbacks, triggering them"
+            self.class.enqueue_callbacks(:complete, @bid)
+            self.class.enqueue_callbacks(:success, @bid) if has_success_callback
+          end
+          
+          return []
+        end
+        
         conditional_redis_increment!(true)
 
         Sidekiq.redis do |r|
