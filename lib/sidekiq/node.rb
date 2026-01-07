@@ -1,4 +1,5 @@
 require 'sidekiq/batch'
+require 'colorize'
 
 module Sidekiq
   class Node

@@ -1,5 +1,7 @@
 # Status snapshot, it is used after the end of job
 
+require 'base64'
+
 module Sidekiq
   class Batch
     class FinalStatusSnapshot

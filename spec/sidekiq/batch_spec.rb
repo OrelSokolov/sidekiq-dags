@@ -271,7 +271,7 @@ describe Sidekiq::Batch do
 
           expect(Sidekiq::Client).to receive(:push_bulk).with(
             'class' => Sidekiq::Batch::Callback::Worker,
-            'args' => [['SampleCallback', event.to_s, opts, batch.bid, nil]],
+            'args' => [['SampleCallback', event.to_s, opts, batch.bid, nil, anything]],
             'queue' => 'default'
           )
           Sidekiq::Batch.enqueue_callbacks(event, batch.bid)
@@ -290,8 +290,8 @@ describe Sidekiq::Batch do
           expect(Sidekiq::Client).to receive(:push_bulk).with(
             'class' => Sidekiq::Batch::Callback::Worker,
             'args' => [
-              ['SampleCallback', event.to_s, opts, batch.bid, nil],
-              ['SampleCallback2', event.to_s, opts2, batch.bid, nil]
+              ['SampleCallback', event.to_s, opts, batch.bid, nil, anything],
+              ['SampleCallback2', event.to_s, opts2, batch.bid, nil, anything]
             ],
             'queue' => 'default'
           )

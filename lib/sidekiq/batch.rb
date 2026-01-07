@@ -4,6 +4,7 @@ require 'sidekiq'
 require 'sidekiq/batch/callback'
 require 'sidekiq/batch/middleware'
 require 'sidekiq/batch/status'
+require 'sidekiq/batch/explicit_status'
 require 'sidekiq/batch/final_status_snapshot'
 require 'sidekiq/batch/version'
 
@@ -193,60 +194,68 @@ module Sidekiq
 
     class << self
       def process_failed_job(bid, jid)
-        _, pending, failed, children, complete, parent_bid = Sidekiq.redis do |r|
-          r.multi do |pipeline|
-            pipeline.sadd("BID-#{bid}-failed", [jid])
-
-            pipeline.hincrby("BID-#{bid}", "pending", 0)
-            pipeline.scard("BID-#{bid}-failed")
-            pipeline.hincrby("BID-#{bid}", "children", 0)
-            pipeline.scard("BID-#{bid}-complete")
-            pipeline.hget("BID-#{bid}", "parent_bid")
-
-            pipeline.expire("BID-#{bid}-failed", BID_EXPIRE_TTL)
-          end
-        end
-
-        # if the batch failed, and has a parent, update the parent to show one pending and failed job
-        if parent_bid
-          Sidekiq.redis do |r|
+        # Используем тот же lock что и для successful jobs для консистентности
+        with_redis_lock("batch-lock-#{bid}", timeout: 5) do
+          _, pending, failed, children, complete, parent_bid = Sidekiq.redis do |r|
             r.multi do |pipeline|
-              pipeline.hincrby("BID-#{parent_bid}", "pending", 1)
-              pipeline.sadd("BID-#{parent_bid}-failed", [jid])
-              pipeline.expire("BID-#{parent_bid}-failed", BID_EXPIRE_TTL)
+              pipeline.sadd("BID-#{bid}-failed", [jid])
+
+              pipeline.hincrby("BID-#{bid}", "pending", 0)
+              pipeline.scard("BID-#{bid}-failed")
+              pipeline.hincrby("BID-#{bid}", "children", 0)
+              pipeline.scard("BID-#{bid}-complete")
+              pipeline.hget("BID-#{bid}", "parent_bid")
+
+              pipeline.expire("BID-#{bid}-failed", BID_EXPIRE_TTL)
             end
           end
-        end
 
-        if pending.to_i == failed.to_i && children == complete
-          enqueue_callbacks(:complete, bid)
+          # if the batch failed, and has a parent, update the parent to show one pending and failed job
+          if parent_bid
+            Sidekiq.redis do |r|
+              r.multi do |pipeline|
+                pipeline.hincrby("BID-#{parent_bid}", "pending", 1)
+                pipeline.sadd("BID-#{parent_bid}-failed", [jid])
+                pipeline.expire("BID-#{parent_bid}-failed", BID_EXPIRE_TTL)
+              end
+            end
+          end
+
+          if pending.to_i == failed.to_i && children == complete
+            enqueue_callbacks(:complete, bid)
+          end
         end
       end
 
       def process_successful_job(bid, jid)
-        Sidekiq.logger.info "PENDING: #{Sidekiq.redis { |r| r.hget("BID-#{bid}", 'pending')} } ".colorize(:light_yellow)
+        # Используем распределенный Redis lock для предотвращения race condition
+        # Без lock'а несколько потоков могут одновременно декрементировать pending,
+        # и batch может быть cleanup'нут до того, как все потоки завершат обработку
+        with_redis_lock("batch-lock-#{bid}", timeout: 5) do
+          Sidekiq.logger.info "PENDING: #{Sidekiq.redis { |r| r.hget("BID-#{bid}", 'pending')} } ".colorize(:light_yellow)
 
-        failed, pending, children, complete, success, total, parent_bid = Sidekiq.redis do |r|
-          r.multi do |pipeline|
-            pipeline.scard("BID-#{bid}-failed")
-            pipeline.hincrby("BID-#{bid}", "pending", -1)
-            pipeline.hincrby("BID-#{bid}", "children", 0)
-            pipeline.scard("BID-#{bid}-complete")
-            pipeline.scard("BID-#{bid}-success")
-            pipeline.hget("BID-#{bid}", "total")
-            pipeline.hget("BID-#{bid}", "parent_bid")
+          failed, pending, children, complete, success, total, parent_bid = Sidekiq.redis do |r|
+            r.multi do |pipeline|
+              pipeline.scard("BID-#{bid}-failed")
+              pipeline.hincrby("BID-#{bid}", "pending", -1)
+              pipeline.hincrby("BID-#{bid}", "children", 0)
+              pipeline.scard("BID-#{bid}-complete")
+              pipeline.scard("BID-#{bid}-success")
+              pipeline.hget("BID-#{bid}", "total")
+              pipeline.hget("BID-#{bid}", "parent_bid")
 
-            pipeline.srem("BID-#{bid}-failed", [jid])
-            pipeline.srem("BID-#{bid}-jids", [jid])
-            pipeline.expire("BID-#{bid}", BID_EXPIRE_TTL)
+              pipeline.srem("BID-#{bid}-failed", [jid])
+              pipeline.srem("BID-#{bid}-jids", [jid])
+              pipeline.expire("BID-#{bid}", BID_EXPIRE_TTL)
+            end
           end
-        end
 
-        all_success = pending.to_i.zero? && children == success
-        # if complete or successfull call complete callback (the complete callback may then call successful)
-        if (pending.to_i == failed.to_i && children == complete) || all_success
-          enqueue_callbacks(:complete, bid)
-          enqueue_callbacks(:success, bid) if all_success
+          all_success = pending.to_i.zero? && children == success
+          # if complete or successfull call complete callback (the complete callback may then call successful)
+          if (pending.to_i == failed.to_i && children == complete) || all_success
+            enqueue_callbacks(:complete, bid)
+            enqueue_callbacks(:success, bid) if all_success
+          end
         end
       end
 
@@ -332,6 +341,45 @@ module Sidekiq
       end
 
     private
+
+      def with_redis_lock(lock_key, timeout: 30, max_wait: 60)
+        # Генерируем уникальный токен для этого lock'а
+        lock_token = SecureRandom.uuid
+        locked = false
+        start_time = Time.now
+
+        begin
+          # Пытаемся получить lock с повторными попытками
+          loop do
+            locked = Sidekiq.redis do |r|
+              # SET NX EX - устанавливает ключ только если его нет, с автоматическим expire
+              r.set(lock_key, lock_token, nx: true, ex: timeout)
+            end
+
+            break if locked
+
+            # Проверяем timeout
+            if Time.now - start_time > max_wait
+              raise "Failed to acquire Redis lock '#{lock_key}' after #{max_wait} seconds"
+            end
+
+            # Очень короткая задержка с jitter для минимизации contention
+            sleep(0.0001 + rand * 0.0001)
+          end
+
+          # Выполняем блок кода под lock'ом
+          yield
+        ensure
+          # Освобождаем lock только если мы его держим (проверяем токен)
+          if locked
+            Sidekiq.redis do |r|
+              # Проверяем что lock всё ещё наш, потом удаляем
+              current_token = r.get(lock_key)
+              r.del(lock_key) if current_token == lock_token
+            end
+          end
+        end
+      end
 
       def push_callbacks args, queue
         Sidekiq::Client.push_bulk(
