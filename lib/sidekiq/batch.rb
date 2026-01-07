@@ -359,7 +359,7 @@ module Sidekiq
       end
 
       def cleanup_redis(bid)
-        Sidekiq.logger.info {"Cleaning redis of batch #{bid}".colorize(:red) }
+        Sidekiq.logger.info {"Cleaning redis of batch #{bid}".colorize(:blue) }
         Sidekiq.redis do |r|
           r.del(
             "BID-#{bid}",
