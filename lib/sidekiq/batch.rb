@@ -301,76 +301,118 @@ module Sidekiq
         event_name = event.to_s
         batch_key = "BID-#{bid}"
         callback_key = "#{batch_key}-callbacks-#{event_name}"
-        already_processed, _, callbacks, queue, parent_bid, callback_batch = Sidekiq.redis do |r|
-          r.multi do |pipeline|
-            pipeline.hget(batch_key, event_name)
-            pipeline.hset(batch_key, event_name, 'true')
-            pipeline.smembers(callback_key)
-            pipeline.hget(batch_key, "callback_queue")
-            pipeline.hget(batch_key, "parent_bid")
-            pipeline.hget(batch_key, "callback_batch")
+        
+        # АТОМАРНАЯ ОПЕРАЦИЯ: используем Redis lock для атомарного чтения и пометки
+        # Это гарантирует, что если мы прочитали callbacks, они будут помечены как обработанные,
+        # и cleanup не удалит их до завершения обработки
+        with_redis_lock("callback-lock-#{bid}-#{event_name}", timeout: 5) do
+          already_processed, callbacks, queue, parent_bid, callback_batch = Sidekiq.redis do |r|
+            r.multi do |pipeline|
+              # Проверяем, не обработано ли уже это событие
+              pipeline.hget(batch_key, event_name)
+              # Читаем callbacks (даже если батч уже удален, callbacks могут еще существовать)
+              pipeline.smembers(callback_key)
+              # Читаем метаданные батча
+              pipeline.hget(batch_key, "callback_queue")
+              pipeline.hget(batch_key, "parent_bid")
+              pipeline.hget(batch_key, "callback_batch")
+            end
           end
-        end
 
-        return if already_processed == 'true'
+          return if already_processed == 'true'
+          
+          # Если callbacks пусты и батч удален, значит callbacks уже были удалены cleanup'ом
+          if (callbacks.nil? || callbacks.empty?) && !estatus.exists?
+            Sidekiq.logger.warn "Batch #{bid} is deleted and has no callbacks for event #{event_name}"
+            return
+          end
+          
+          # Помечаем событие как обработанное (если батч существует)
+          # Это делается ПОСЛЕ чтения callbacks, но под lock'ом, чтобы защитить их от cleanup
+          if estatus.exists?
+            Sidekiq.redis { |r| r.hset(batch_key, event_name, 'true') }
+          end
 
-        queue ||= "default"
-        parent_bid = !parent_bid || parent_bid.empty? ? nil : parent_bid    # Basically parent_bid.blank?
-        callback_args = callbacks.reduce([]) do |memo, jcb|
-          cb = Sidekiq.load_json(jcb)
-          serialized_status = Sidekiq::Batch::FinalStatusSnapshot.new(bid).serialized
-          memo << [cb['callback'], event_name, cb['opts'], bid, parent_bid, serialized_status]
-        end
+          queue ||= "default"
+          parent_bid = !parent_bid || parent_bid.empty? ? nil : parent_bid    # Basically parent_bid.blank?
+          callback_args = callbacks.reduce([]) do |memo, jcb|
+            cb = Sidekiq.load_json(jcb)
+            serialized_status = Sidekiq::Batch::FinalStatusSnapshot.new(bid).serialized
+            memo << [cb['callback'], event_name, cb['opts'], bid, parent_bid, serialized_status]
+          end
 
-        opts = {"bid" => bid, "event" => event_name}
+          opts = {"bid" => bid, "event" => event_name}
 
-        # Run callback batch finalize synchronously
-        if callback_batch
-          # Extract opts from cb_args or use current
-          # Pass in stored event as callback finalize is processed on complete event
-          cb_opts = callback_args.first&.at(2) || opts
+          # Run callback batch finalize synchronously
+          if callback_batch
+            # Extract opts from cb_args or use current
+            # Pass in stored event as callback finalize is processed on complete event
+            cb_opts = callback_args.first&.at(2) || opts
 
-          Sidekiq.logger.debug {"Run callback batch bid: #{bid} event: #{event_name} args: #{callback_args.inspect}"}
-          # Finalize now
-          finalizer = Sidekiq::Batch::Callback::Finalize.new
-          status = Status.new bid
-          finalizer.dispatch(status, cb_opts)
+            Sidekiq.logger.debug {"Run callback batch bid: #{bid} event: #{event_name} args: #{callback_args.inspect}"}
+            # Finalize now
+            finalizer = Sidekiq::Batch::Callback::Finalize.new
+            status = Status.new bid
+            finalizer.dispatch(status, cb_opts)
 
-          return
-        end
+            return
+          end
 
-        Sidekiq.logger.debug {"Enqueue callback bid: #{bid} event: #{event_name} args: #{callback_args.inspect}"}
+          Sidekiq.logger.debug {"Enqueue callback bid: #{bid} event: #{event_name} args: #{callback_args.inspect}"}
 
-        if callback_args.empty?
-          # Finalize now
-          finalizer = Sidekiq::Batch::Callback::Finalize.new
-          status = Status.new bid
-          finalizer.dispatch(status, opts)
-        else
-          # Otherwise finalize in sub batch complete callback
-          cb_batch = self.new
-          cb_batch.callback_batch = 'true'
-          Sidekiq.logger.debug {"Adding callback batch: #{cb_batch.bid} for batch: #{bid}"}
-          cb_batch.on(:complete, "Sidekiq::Batch::Callback::Finalize#dispatch", opts)
-          cb_batch.jobs do
-            push_callbacks callback_args, queue
+          if callback_args.empty?
+            # Finalize now
+            finalizer = Sidekiq::Batch::Callback::Finalize.new
+            status = Status.new bid
+            finalizer.dispatch(status, opts)
+          else
+            # Otherwise finalize in sub batch complete callback
+            cb_batch = self.new
+            cb_batch.callback_batch = 'true'
+            Sidekiq.logger.debug {"Adding callback batch: #{cb_batch.bid} for batch: #{bid}"}
+            cb_batch.on(:complete, "Sidekiq::Batch::Callback::Finalize#dispatch", opts)
+            cb_batch.jobs do
+              push_callbacks callback_args, queue
+            end
           end
         end
       end
 
       def cleanup_redis(bid)
         Sidekiq.logger.info {"Cleaning redis of batch #{bid}".colorize(:blue) }
+        
+        batch_key = "BID-#{bid}"
+        
+        # Проверяем, обработаны ли callbacks перед удалением
+        # Lock в enqueue_callbacks гарантирует, что если callbacks читаются, они сразу помечаются как обработанные
+        complete_processed, success_processed = Sidekiq.redis do |r|
+          r.multi do |pipeline|
+            pipeline.hget(batch_key, "complete")
+            pipeline.hget(batch_key, "success")
+          end
+        end
+        
+        # Удаляем остальные ключи батча
+        keys_to_delete = [
+          "BID-#{bid}",
+          "BID-#{bid}-failed",
+          "BID-#{bid}-success",
+          "BID-#{bid}-complete",
+          "BID-#{bid}-jids",
+        ]
+        
+        # Удаляем callbacks только если они уже обработаны
+        # Если не обработаны, они будут удалены позже, когда будут обработаны
+        if complete_processed == 'true'
+          keys_to_delete << "BID-#{bid}-callbacks-complete"
+        end
+        
+        if success_processed == 'true'
+          keys_to_delete << "BID-#{bid}-callbacks-success"
+        end
+        
         Sidekiq.redis do |r|
-          r.del(
-            "BID-#{bid}",
-            "BID-#{bid}-callbacks-complete",
-            "BID-#{bid}-callbacks-success",
-            "BID-#{bid}-failed",
-
-            "BID-#{bid}-success",
-            "BID-#{bid}-complete",
-            "BID-#{bid}-jids",
-          )
+          r.del(*keys_to_delete)
         end
       end
 

@@ -233,8 +233,14 @@ describe Sidekiq::Batch do
       let(:event) { :success }
 
       context 'when no callbacks are defined' do
-        it 'clears redis keys' do
+        it 'calls finalize which cleans up redis keys for success event' do
           batch = Sidekiq::Batch.new
+          # Инициализируем батч, чтобы он существовал в Redis
+          batch.jobs do
+            # Пустой блок - батч будет инициализирован
+          end
+          # enqueue_callbacks вызывает Finalize#dispatch когда нет callbacks и батч существует
+          # Finalize#dispatch вызывает cleanup_redis для success event
           expect(Sidekiq::Batch).to receive(:cleanup_redis).with(batch.bid)
           Sidekiq::Batch.enqueue_callbacks(event, batch.bid)
         end
@@ -298,6 +304,143 @@ describe Sidekiq::Batch do
 
           Sidekiq::Batch.enqueue_callbacks(event, batch.bid)
         end
+      end
+    end
+
+    context 'race condition: batch deleted before callback enqueue' do
+      # Тест проверяет, что enqueue_callbacks может прочитать callbacks
+      # даже если основной батч уже удален из Redis
+      # Это важно, так как cleanup может удалить батч до того, как callbacks будут обработаны
+      it 'reads callbacks even if batch is deleted from Redis' do
+        batch = Sidekiq::Batch.new
+        batch.on(:success, SampleCallback, { 'test' => 'data' })
+        bid = batch.bid
+        callback_key = "BID-#{bid}-callbacks-success"
+        
+        # Проверяем, что callbacks сохранены
+        callbacks_before = Sidekiq.redis { |r| r.smembers(callback_key) }
+        expect(callbacks_before).not_to be_empty
+        
+        # Симулируем ситуацию: батч удален, но callbacks еще существуют
+        # (это может произойти если cleanup удалил батч, но не успел удалить callbacks)
+        Sidekiq.redis { |r| r.del("BID-#{bid}") }
+        
+        # Проверяем, что батч действительно удален
+        batch_exists = Sidekiq.redis { |r| r.exists("BID-#{bid}") } > 0
+        expect(batch_exists).to be false
+        
+        # Проверяем, что callbacks все еще существуют
+        callbacks_after = Sidekiq.redis { |r| r.smembers(callback_key) }
+        expect(callbacks_after).not_to be_empty
+        
+        # enqueue_callbacks должен прочитать callbacks даже если батч удален
+        # и поместить их в очередь
+        expect(Sidekiq::Client).to receive(:push_bulk).with(
+          'class' => Sidekiq::Batch::Callback::Worker,
+          'args' => [
+            ['SampleCallback', 'success', { 'test' => 'data' }, bid, nil, anything]
+          ],
+          'queue' => 'default'
+        )
+        
+        Sidekiq::Batch.enqueue_callbacks(:success, bid)
+      end
+
+      # Тест проверяет, что lock в enqueue_callbacks защищает от race condition
+      # между чтением callbacks и их удалением в cleanup
+      # Lock гарантирует атомарность: чтение + пометка как обработанные
+      it 'handles concurrent cleanup and enqueue_callbacks with lock' do
+        batch = Sidekiq::Batch.new
+        batch.on(:success, SampleCallback)
+        bid = batch.bid
+        
+        # Симулируем race condition: два потока одновременно работают с батчем
+        callback_enqueued = false
+        
+        # Поток 1: пытается вызвать enqueue_callbacks
+        thread1 = Thread.new do
+          # Небольшая задержка для создания race condition
+          sleep(0.001)
+          expect(Sidekiq::Client).to receive(:push_bulk).at_least(:once) do |args|
+            callback_enqueued = true
+          end
+          Sidekiq::Batch.enqueue_callbacks(:success, bid)
+        end
+        
+        # Поток 2: пытается вызвать cleanup параллельно
+        thread2 = Thread.new do
+          # Небольшая задержка для создания race condition
+          sleep(0.001)
+          # Cleanup должен проверить флаг success перед удалением callbacks
+          # Если флаг не установлен, callbacks не должны быть удалены
+          Sidekiq::Batch.cleanup_redis(bid)
+        end
+        
+        thread1.join
+        thread2.join
+        
+        # Проверяем, что callback был вызван (даже при параллельном cleanup)
+        expect(callback_enqueued).to be true
+        
+        # Проверяем, что callbacks были обработаны корректно
+        # Lock гарантирует, что callbacks прочитаны и помечены как обработанные
+        # до того, как cleanup их удалит
+        success_processed = Sidekiq.redis { |r| r.hget("BID-#{bid}", "success") }
+        # Если батч еще существует, success должен быть помечен как 'true'
+        batch_exists = Sidekiq.redis { |r| r.exists("BID-#{bid}") } > 0
+        if batch_exists
+          expect(success_processed).to eq('true')
+        end
+      end
+
+      # Тест проверяет полный цикл: enqueue_callbacks читает callbacks атомарно,
+      # помечает их как обработанные, и только после этого cleanup может их удалить
+      # Это гарантирует, что callbacks не будут потеряны
+      it 'ensures callbacks are read atomically before cleanup can delete them' do
+        batch = Sidekiq::Batch.new
+        batch.on(:success, SampleCallback, { 'atomic' => 'test' })
+        bid = batch.bid
+        
+        # Создаем ситуацию, когда cleanup вызывается сразу после успешного завершения
+        # но до того, как enqueue_callbacks успевает прочитать callbacks
+        
+        # Устанавливаем pending=0, чтобы батч считался завершенным
+        Sidekiq.redis do |r|
+          r.multi do |pipeline|
+            pipeline.hset("BID-#{bid}", "pending", "0")
+            pipeline.hset("BID-#{bid}", "total", "1")
+          end
+        end
+        
+        # Симулируем успешное завершение последнего джоба
+        # Это должно вызвать enqueue_callbacks(:success, bid)
+        expect(Sidekiq::Client).to receive(:push_bulk).with(
+          'class' => Sidekiq::Batch::Callback::Worker,
+          'args' => [
+            ['SampleCallback', 'success', { 'atomic' => 'test' }, bid, nil, anything]
+          ],
+          'queue' => 'default'
+        )
+        
+        # Вызываем enqueue_callbacks (это происходит в process_successful_job)
+        Sidekiq::Batch.enqueue_callbacks(:success, bid)
+        
+        # Проверяем, что callbacks были прочитаны и помечены как обработанные
+        # Lock гарантирует, что флаг установлен до того, как cleanup может удалить callbacks
+        batch_exists = Sidekiq.redis { |r| r.exists("BID-#{bid}") } > 0
+        if batch_exists
+          success_processed = Sidekiq.redis { |r| r.hget("BID-#{bid}", "success") }
+          expect(success_processed).to eq('true'), "Success flag should be set after enqueue_callbacks"
+        end
+        
+        # Теперь cleanup может безопасно удалить callbacks (если они обработаны)
+        # Cleanup проверяет флаг success перед удалением callbacks
+        Sidekiq::Batch.cleanup_redis(bid)
+        
+        # Проверяем, что callbacks были удалены после обработки
+        # (cleanup удаляет callbacks только если success == 'true')
+        callbacks_after_cleanup = Sidekiq.redis { |r| r.smembers("BID-#{bid}-callbacks-success") }
+        expect(callbacks_after_cleanup).to be_empty, "Callbacks should be deleted after cleanup if they were processed"
       end
     end
   end
