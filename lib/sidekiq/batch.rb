@@ -328,7 +328,7 @@ module Sidekiq
           end
           
           # Помечаем событие как обработанное (если батч существует)
-          # Это делается ПОСЛЕ чтения callbacks, но под lock'ом, чтобы защитить их от cleanup
+          # Это делается ДО обработки callbacks, чтобы защитить их от cleanup
           if estatus.exists?
             Sidekiq.redis { |r| r.hset(batch_key, event_name, 'true') }
           end
@@ -342,6 +342,13 @@ module Sidekiq
           end
 
           opts = {"bid" => bid, "event" => event_name}
+          
+          # Удаляем callbacks после их чтения и постановки в очередь
+          # Это безопасно, так как callbacks уже прочитаны и поставлены в очередь Sidekiq
+          # Они будут выполнены асинхронно, даже если ключи удалены из Redis
+          if !callbacks.empty?
+            Sidekiq.redis { |r| r.del(callback_key) }
+          end
 
           # Run callback batch finalize synchronously
           if callback_batch
@@ -381,18 +388,9 @@ module Sidekiq
       def cleanup_redis(bid)
         Sidekiq.logger.info {"Cleaning redis of batch #{bid}".colorize(:blue) }
         
-        batch_key = "BID-#{bid}"
-        
-        # Проверяем, обработаны ли callbacks перед удалением
-        # Lock в enqueue_callbacks гарантирует, что если callbacks читаются, они сразу помечаются как обработанные
-        complete_processed, success_processed = Sidekiq.redis do |r|
-          r.multi do |pipeline|
-            pipeline.hget(batch_key, "complete")
-            pipeline.hget(batch_key, "success")
-          end
-        end
-        
-        # Удаляем остальные ключи батча
+        # Удаляем только основные ключи батча, НЕ удаляем callbacks
+        # Callbacks могут быть еще в очереди Sidekiq и не выполнены
+        # Callbacks удалятся автоматически по TTL (30 дней) или когда будут обработаны
         keys_to_delete = [
           "BID-#{bid}",
           "BID-#{bid}-failed",
@@ -401,19 +399,13 @@ module Sidekiq
           "BID-#{bid}-jids",
         ]
         
-        # Удаляем callbacks только если они уже обработаны
-        # Если не обработаны, они будут удалены позже, когда будут обработаны
-        if complete_processed == 'true'
-          keys_to_delete << "BID-#{bid}-callbacks-complete"
-        end
-        
-        if success_processed == 'true'
-          keys_to_delete << "BID-#{bid}-callbacks-success"
-        end
-        
         Sidekiq.redis do |r|
           r.del(*keys_to_delete)
         end
+        
+        # Callbacks НЕ удаляем - они могут быть еще не выполнены
+        # Они будут удалены по TTL или когда enqueue_callbacks их обработает
+        # Это гарантирует, что callbacks не будут потеряны даже если батч удален
       end
 
     private

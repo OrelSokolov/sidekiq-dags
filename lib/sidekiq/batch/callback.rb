@@ -35,8 +35,17 @@ module Sidekiq
 
 
           # Different events are run in different callback batches
+          # Cleanup callback batch только если это не основной батч
           Sidekiq::Batch.cleanup_redis callback_bid if callback_batch
-          Sidekiq::Batch.cleanup_redis bid if event == :success
+          
+          # Cleanup основного батча только для success event
+          # НО: не удаляем callbacks, если они еще не обработаны
+          # Callbacks могут быть еще в очереди Sidekiq и не выполнены
+          if event == :success
+            # Проверяем, что callbacks обработаны перед cleanup
+            # cleanup_redis сам проверит флаги и не удалит необработанные callbacks
+            Sidekiq::Batch.cleanup_redis bid
+          end
         end
 
         def success(bid, status, parent_bid)

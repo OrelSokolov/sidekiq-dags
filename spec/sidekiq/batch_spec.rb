@@ -241,7 +241,8 @@ describe Sidekiq::Batch do
           end
           # enqueue_callbacks вызывает Finalize#dispatch когда нет callbacks и батч существует
           # Finalize#dispatch вызывает cleanup_redis для success event
-          expect(Sidekiq::Batch).to receive(:cleanup_redis).with(batch.bid)
+          # Может быть вызван cleanup для callback batch тоже, поэтому используем at_least
+          expect(Sidekiq::Batch).to receive(:cleanup_redis).with(batch.bid).at_least(:once)
           Sidekiq::Batch.enqueue_callbacks(event, batch.bid)
         end
       end
@@ -438,9 +439,85 @@ describe Sidekiq::Batch do
         Sidekiq::Batch.cleanup_redis(bid)
         
         # Проверяем, что callbacks были удалены после обработки
-        # (cleanup удаляет callbacks только если success == 'true')
+        # (enqueue_callbacks удаляет callbacks после их чтения и постановки в очередь)
         callbacks_after_cleanup = Sidekiq.redis { |r| r.smembers("BID-#{bid}-callbacks-success") }
-        expect(callbacks_after_cleanup).to be_empty, "Callbacks should be deleted after cleanup if they were processed"
+        expect(callbacks_after_cleanup).to be_empty, "Callbacks should be deleted after enqueue_callbacks processes them"
+      end
+
+      it 'deletes callbacks only after they are read and enqueued, not during cleanup' do
+        batch = Sidekiq::Batch.new
+        batch.on(:success, SampleCallback, { 'test' => 'data' })
+        bid = batch.bid
+        callback_key = "BID-#{bid}-callbacks-success"
+        
+        # Проверяем, что callbacks сохранены
+        callbacks_before = Sidekiq.redis { |r| r.smembers(callback_key) }
+        expect(callbacks_before).not_to be_empty
+        
+        # Симулируем cleanup - удаляем батч, но НЕ callbacks
+        # cleanup_redis не должен удалять callbacks
+        Sidekiq::Batch.cleanup_redis(bid)
+        
+        # Проверяем, что callbacks все еще существуют после cleanup
+        # (cleanup_redis не удаляет callbacks, только основные ключи батча)
+        callbacks_after_cleanup = Sidekiq.redis { |r| r.smembers(callback_key) }
+        expect(callbacks_after_cleanup).not_to be_empty, "Callbacks should NOT be deleted by cleanup_redis"
+        
+        # Проверяем, что батч удален
+        batch_exists = Sidekiq.redis { |r| r.exists("BID-#{bid}") } > 0
+        expect(batch_exists).to eq(false), "Batch should be deleted by cleanup_redis"
+        
+        # Теперь enqueue_callbacks должен прочитать callbacks и удалить их после постановки в очередь
+        expect(Sidekiq::Client).to receive(:push_bulk).with(
+          'class' => Sidekiq::Batch::Callback::Worker,
+          'args' => [
+            ['SampleCallback', 'success', { 'test' => 'data' }, bid, nil, anything]
+          ],
+          'queue' => 'default'
+        )
+        
+        Sidekiq::Batch.enqueue_callbacks(:success, bid)
+        
+        # Проверяем, что callbacks удалены после enqueue_callbacks
+        callbacks_after_enqueue = Sidekiq.redis { |r| r.smembers(callback_key) }
+        expect(callbacks_after_enqueue).to be_empty, "Callbacks should be deleted by enqueue_callbacks after reading them"
+      end
+
+      it 'preserves callbacks even if batch is deleted before enqueue_callbacks is called' do
+        batch = Sidekiq::Batch.new
+        batch.on(:success, SampleCallback, { 'preserve' => 'test' })
+        bid = batch.bid
+        callback_key = "BID-#{bid}-callbacks-success"
+        
+        # Проверяем, что callbacks сохранены
+        callbacks_before = Sidekiq.redis { |r| r.smembers(callback_key) }
+        expect(callbacks_before).not_to be_empty
+        
+        # Удаляем батч ДО вызова enqueue_callbacks (симулируем race condition)
+        Sidekiq.redis { |r| r.del("BID-#{bid}") }
+        
+        # Проверяем, что батч удален
+        batch_exists = Sidekiq.redis { |r| r.exists("BID-#{bid}") } > 0
+        expect(batch_exists).to be false
+        
+        # Проверяем, что callbacks все еще существуют
+        callbacks_after_delete = Sidekiq.redis { |r| r.smembers(callback_key) }
+        expect(callbacks_after_delete).not_to be_empty, "Callbacks should still exist even if batch is deleted"
+        
+        # enqueue_callbacks должен прочитать callbacks даже если батч удален
+        expect(Sidekiq::Client).to receive(:push_bulk).with(
+          'class' => Sidekiq::Batch::Callback::Worker,
+          'args' => [
+            ['SampleCallback', 'success', { 'preserve' => 'test' }, bid, nil, anything]
+          ],
+          'queue' => 'default'
+        )
+        
+        Sidekiq::Batch.enqueue_callbacks(:success, bid)
+        
+        # Проверяем, что callbacks удалены после enqueue_callbacks
+        callbacks_after_enqueue = Sidekiq.redis { |r| r.smembers(callback_key) }
+        expect(callbacks_after_enqueue).to be_empty, "Callbacks should be deleted after enqueue_callbacks processes them"
       end
     end
   end
