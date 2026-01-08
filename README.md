@@ -30,7 +30,7 @@ Sidekiq Batch is MOSTLY a drop-in replacement for the API from Sidekiq PRO. See 
 Новый DSL для создания пайплайнов напрямую из батчей:
 
 ```ruby
-require 'sidekiq-dags'
+require 'sidekiq_dags'
 
 module MyApp
   extend Sidekiq::NodeDsl
