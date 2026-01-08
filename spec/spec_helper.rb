@@ -2,6 +2,18 @@ require "simplecov"
 SimpleCov.start
 
 $LOAD_PATH.unshift File.expand_path('../../lib', __FILE__)
+
+# Загружаем ActiveRecord и настраиваем БД перед загрузкой sidekiq/batch
+begin
+  require 'active_record'
+  require 'active_support/core_ext'
+rescue LoadError
+  # ActiveRecord не доступен, пропускаем
+end
+
+# Загружаем настройку БД перед загрузкой sidekiq/batch
+Dir[File.dirname(__FILE__) + "/support/**/*.rb"].each {|f| require f }
+
 require 'sidekiq/batch'
 
 redis_opts = { url: "redis://127.0.0.1:6379/1" }
@@ -24,5 +36,3 @@ RSpec.configure do |config|
     end
   end
 end
-
-Dir[File.dirname(__FILE__) + "/support/**/*.rb"].each {|f| require f }

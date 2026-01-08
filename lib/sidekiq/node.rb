@@ -22,8 +22,21 @@ module Sidekiq
       define_method(:next_node) do
         klass = arg
         if klass.kind_of?(Symbol)
-          namespace = self.class.name.deconstantize # "Rustat::EndNode" → "Rustat"
-          (namespace + "::" + klass.to_s).constantize
+          class_name = self.class.name
+          # Извлекаем namespace из имени класса
+          namespace = if class_name.include?('::')
+            class_name.split('::')[0..-2].join('::')
+          else
+            ''
+          end
+          full_name = namespace.empty? ? klass.to_s : "#{namespace}::#{klass.to_s}"
+          # Используем constantize из ActiveSupport или простой поиск константы
+          if defined?(ActiveSupport::Inflector)
+            full_name.constantize
+          else
+            # Простой поиск константы
+            full_name.split('::').inject(Object) { |o, name| o.const_get(name) }
+          end
         else
           klass
         end
@@ -58,6 +71,13 @@ module Sidekiq
 
     def perform(*args, **kwargs)
       observer
+      
+      # Отслеживание начала ноды (если включен PipelineTracking)
+      if respond_to?(:mark_node_started!)
+        started = mark_node_started!
+        return unless started # Если пайплайн уже запущен, не запускаем ноду
+      end
+      
       @batch = Sidekiq::Batch.new
 
       @batch.add_jobs do
@@ -65,24 +85,51 @@ module Sidekiq
         execute(*args, **kwargs)
       end
 
-      @batch.on(:complete, self.class)
+      # Регистрируем callback для отслеживания статусов пайплайна
+      # Если используется PipelineTracking, PipelineCallback будет запускать следующую ноду
+      # Стандартный callback нужен только для логирования
+      if respond_to?(:pipeline_name) && respond_to?(:node_name)
+        pipeline_name = self.pipeline_name
+        node_name = self.node_name
+        @batch.on(:complete, Sidekiq::PipelineCallback, {
+          'pipeline_name' => pipeline_name,
+          'node_name' => node_name
+        })
+        @batch.on(:failure, Sidekiq::PipelineCallback, {
+          'pipeline_name' => pipeline_name,
+          'node_name' => node_name
+        })
+        # Не регистрируем стандартный callback, если используется PipelineTracking
+        # PipelineCallback сам запустит следующую ноду
+      else
+        # Если PipelineTracking не используется, используем стандартный callback
+        @batch.on(:complete, self.class)
+      end
       @batch.run
 
       s = Sidekiq::Batch::ExplicitStatus.new(@batch.bid)
       # Sidekiq.logger.info "#{Time.current.to_f} 🔥 EXISTS? #{s.exists?}".colorize(:red)
       # Sidekiq.logger.info s.data.to_s.colorize(:light_yellow)
 
-      notify_all "➡️ #{desc.present? ? desc : self.class} -> (#{s.total})    | #{@batch.bid}"
+      desc_str = desc
+      desc_str = desc_str.present? if desc_str.respond_to?(:present?)
+      desc_str = desc if desc_str.nil? || (desc_str.respond_to?(:empty?) && desc_str.empty?)
+      notify_all "➡️ #{desc_str || self.class} -> (#{s.total})    | #{@batch.bid}"
     end
 
     def on_complete(status, options)
       # Sidekiq.logger.info "#{Time.current.to_f} 🔥 ON COMPLETE EXISTS? #{status.exists?}".colorize(:red)
       # Sidekiq.logger.info status.data.to_s.colorize(:yellow)
 
-      notify_all "✔️ #{desc.present? ? desc : self.class} (#{status.total})   |  #{status.bid}"
-      if next_node.present?
-        notify_all "➕ #{next_node} "
-        next_node&.perform_async
+      desc_str = desc
+      desc_str = desc_str.present? if desc_str.respond_to?(:present?)
+      desc_str = desc if desc_str.nil? || (desc_str.respond_to?(:empty?) && desc_str.empty?)
+      notify_all "✔️ #{desc_str || self.class} (#{status.total})   |  #{status.bid}"
+      
+      next_node_class = next_node
+      if next_node_class && (next_node_class.respond_to?(:present?) ? next_node_class.present? : !next_node_class.nil?)
+        notify_all "➕ #{next_node_class} "
+        next_node_class.perform_async
       else
         notify_all "✅ Конец графа #{sidekiq_queue}."
       end
