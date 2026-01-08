@@ -331,6 +331,41 @@ module Sidekiq
             return
           end
           
+          # КРИТИЧЕСКАЯ ПРОВЕРКА: callback не должен выполняться, пока pending > 0
+          # Это гарантирует синхронизацию - callback выполнится только после завершения всех джобов
+          pending, children, complete, success, failed = Sidekiq.redis do |r|
+            r.multi do |pipeline|
+              pipeline.hget(batch_key, "pending")
+              pipeline.hget(batch_key, "children")
+              pipeline.scard("#{batch_key}-complete")
+              pipeline.scard("#{batch_key}-success")
+              pipeline.scard("#{batch_key}-failed")
+            end
+          end
+          
+          pending = pending.to_i
+          children = children.to_i
+          complete = complete.to_i
+          success = success.to_i
+          failed = failed.to_i
+          
+          # Для complete callback: pending должен быть равен failed (все джобы завершены или провалены)
+          # И все дочерние батчи должны быть завершены (children == complete)
+          if event_name == 'complete'
+            if pending != failed || children != complete
+              Sidekiq.logger.debug "Callback #{event_name} for batch #{bid} skipped: pending=#{pending}, failed=#{failed}, children=#{children}, complete=#{complete}"
+              return
+            end
+          end
+          
+          # Для success callback: pending должен быть 0 И все дочерние батчи успешны (children == success)
+          if event_name == 'success'
+            if pending != 0 || children != success
+              Sidekiq.logger.debug "Callback #{event_name} for batch #{bid} skipped: pending=#{pending}, children=#{children}, success=#{success}"
+              return
+            end
+          end
+          
           callbacks, queue, parent_bid, callback_batch = Sidekiq.redis do |r|
             r.multi do |pipeline|
               # Читаем callbacks (даже если батч уже удален, callbacks могут еще существовать)

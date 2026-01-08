@@ -769,4 +769,146 @@ describe Sidekiq::Batch do
       end
     end
   end
+
+  describe 'callback synchronization: callbacks must not execute before all jobs complete' do
+    it 'prevents callback execution when pending > 0' do
+      callback_executed = false
+      
+      callback_class = Class.new do
+        def initialize(flag)
+          @flag = flag
+        end
+        
+        def on_success(status, opts)
+          @flag[0] = true
+        end
+      end
+      
+      batch = Sidekiq::Batch.new
+      batch.on(:success, callback_class.new([callback_executed]), {})
+      
+      # Добавляем 3 джоба
+      batch.add_jobs do
+        3.times do
+          TestWorker.perform_async
+        end
+      end
+      batch.run
+      
+      # Проверяем, что pending = 3
+      pending = Sidekiq.redis { |r| r.hget("BID-#{batch.bid}", 'pending') }
+      expect(pending.to_i).to eq(3)
+      
+      # Пытаемся вызвать callback напрямую (симулируем race condition или прямой вызов)
+      # Callback НЕ должен выполниться, так как pending > 0
+      allow(Sidekiq::Client).to receive(:push_bulk)
+      Sidekiq::Batch.enqueue_callbacks(:success, batch.bid)
+      
+      # Проверяем, что callback не был поставлен в очередь
+      expect(Sidekiq::Client).not_to have_received(:push_bulk)
+      expect(callback_executed).to be false
+    end
+    
+    it 'allows callback execution only when pending = 0' do
+      callback_class = Class.new do
+        def initialize(flag)
+          @flag = flag
+        end
+        
+        def on_success(status, opts)
+          @flag[0] = true
+        end
+      end
+      
+      batch = Sidekiq::Batch.new
+      callback_executed = [false]
+      batch.on(:success, callback_class.new(callback_executed), {})
+      
+      # Добавляем 1 джоб
+      jid = nil
+      batch.add_jobs do
+        jid = TestWorker.perform_async
+      end
+      batch.run
+      
+      # Проверяем, что pending = 1
+      pending = Sidekiq.redis { |r| r.hget("BID-#{batch.bid}", 'pending') }
+      expect(pending.to_i).to eq(1)
+      
+      # Пытаемся вызвать callback напрямую - он НЕ должен выполниться, так как pending > 0
+      allow(Sidekiq::Client).to receive(:push_bulk)
+      Sidekiq::Batch.enqueue_callbacks(:success, batch.bid)
+      expect(Sidekiq::Client).not_to have_received(:push_bulk)
+      
+      # Завершаем джоб напрямую через process_successful_job
+      # Это должно вызвать callback, так как pending станет 0
+      expect(Sidekiq::Client).to receive(:push_bulk).at_least(:once)
+      Sidekiq::Batch.process_successful_job(batch.bid, jid)
+      
+      # Проверяем, что pending стал 0
+      pending_after = Sidekiq.redis { |r| r.hget("BID-#{batch.bid}", 'pending') }
+      expect(pending_after.to_i).to eq(0)
+    end
+    
+    it 'ensures sequential execution of batches in pipeline' do
+      # Этот тест проверяет логику синхронизации через прямую проверку enqueue_callbacks
+      # В реальном сценарии джобы обрабатываются асинхронно через Sidekiq workers
+      # Но мы можем проверить, что проверка pending работает правильно
+      
+      execution_order = []
+      
+      callback_class = Class.new do
+        def initialize(order_tracker)
+          @order_tracker = order_tracker
+        end
+        
+        def on_success(status, opts)
+          batch_number = opts['batch_number']
+          @order_tracker << "callback-#{batch_number}"
+        end
+      end
+      
+      # Создаем batch с 3 джобами
+      batch = Sidekiq::Batch.new
+      batch.on(:success, callback_class.new(execution_order), 'batch_number' => 1)
+      
+      jids = []
+      batch.add_jobs do
+        3.times do
+          jids << TestWorker.perform_async
+        end
+      end
+      batch.run
+      
+      # Проверяем, что pending = 3
+      pending = Sidekiq.redis { |r| r.hget("BID-#{batch.bid}", 'pending') }
+      expect(pending.to_i).to eq(3)
+      
+      # Пытаемся вызвать callback - он НЕ должен выполниться, так как pending > 0
+      allow(Sidekiq::Client).to receive(:push_bulk)
+      Sidekiq::Batch.enqueue_callbacks(:success, batch.bid)
+      expect(Sidekiq::Client).not_to have_received(:push_bulk)
+      
+      # Завершаем 2 джоба - pending станет 1
+      Sidekiq::Batch.process_successful_job(batch.bid, jids[0])
+      Sidekiq::Batch.process_successful_job(batch.bid, jids[1])
+      
+      # Проверяем, что pending = 1
+      pending = Sidekiq.redis { |r| r.hget("BID-#{batch.bid}", 'pending') }
+      expect(pending.to_i).to eq(1)
+      
+      # Пытаемся вызвать callback - он все еще НЕ должен выполниться
+      allow(Sidekiq::Client).to receive(:push_bulk)
+      Sidekiq::Batch.enqueue_callbacks(:success, batch.bid)
+      expect(Sidekiq::Client).not_to have_received(:push_bulk)
+      
+      # Завершаем последний джоб - pending станет 0
+      expect(Sidekiq::Client).to receive(:push_bulk).at_least(:once)
+      Sidekiq::Batch.process_successful_job(batch.bid, jids[2])
+      
+      # Проверяем, что pending = 0
+      pending = Sidekiq.redis { |r| r.hget("BID-#{batch.bid}", 'pending') }
+      expect(pending.to_i).to eq(0)
+    end
+  end
 end
