@@ -16,6 +16,11 @@ module Sidekiq
     class NoBlockGivenError < StandardError; end
 
     BID_EXPIRE_TTL = 2_592_000
+    
+    # TTL для флагов обработки callbacks (24 часа)
+    # Флаги хранятся отдельно от основного батча и гарантируют идемпотентность
+    # даже после cleanup основного батча
+    CALLBACK_FLAG_TTL = 86_400
 
     attr_reader :bid, :description, :callback_queue, :created_at
 
@@ -295,21 +300,27 @@ module Sidekiq
 
       def enqueue_callbacks(event, bid)
         Sidekiq.logger.info "ENQUEUE CALLBACKS FOR #{event} #{bid}".colorize(:light_green)
-        estatus = Sidekiq::Batch::ExplicitStatus.new(bid)
-        Sidekiq.logger.info "status for #{bid} exists? #{estatus.exists?}"
 
         event_name = event.to_s
         batch_key = "BID-#{bid}"
         callback_key = "#{batch_key}-callbacks-#{event_name}"
         
+        # ОТДЕЛЬНЫЙ ключ для флага обработки - НЕ удаляется при cleanup!
+        # Это гарантирует идемпотентность даже после удаления батча
+        processed_flag_key = "#{batch_key}-processed-#{event_name}"
+        
         # АТОМАРНАЯ ОПЕРАЦИЯ: используем Redis lock для атомарного чтения и пометки
-        # Это гарантирует, что если мы прочитали callbacks, они будут помечены как обработанные,
-        # и cleanup не удалит их до завершения обработки
         with_redis_lock("callback-lock-#{bid}-#{event_name}", timeout: 5) do
-          already_processed, callbacks, queue, parent_bid, callback_batch = Sidekiq.redis do |r|
+          # Проверяем флаг обработки в ОТДЕЛЬНОМ ключе (не удаляется при cleanup)
+          already_processed = Sidekiq.redis { |r| r.get(processed_flag_key) }
+          
+          if already_processed == 'true'
+            Sidekiq.logger.debug "Callback #{event_name} for batch #{bid} already processed, skipping"
+            return
+          end
+          
+          callbacks, queue, parent_bid, callback_batch = Sidekiq.redis do |r|
             r.multi do |pipeline|
-              # Проверяем, не обработано ли уже это событие
-              pipeline.hget(batch_key, event_name)
               # Читаем callbacks (даже если батч уже удален, callbacks могут еще существовать)
               pipeline.smembers(callback_key)
               # Читаем метаданные батча
@@ -318,19 +329,25 @@ module Sidekiq
               pipeline.hget(batch_key, "callback_batch")
             end
           end
-
-          return if already_processed == 'true'
           
-          # Если callbacks пусты и батч удален, значит callbacks уже были удалены cleanup'ом
-          if (callbacks.nil? || callbacks.empty?) && !estatus.exists?
-            Sidekiq.logger.warn "Batch #{bid} is deleted and has no callbacks for event #{event_name}"
-            return
+          # СРАЗУ помечаем событие как обработанное в ОТДЕЛЬНОМ ключе с TTL
+          # Это предотвращает race condition и гарантирует идемпотентность
+          # Даже если батч будет удален, флаг останется на 24 часа
+          Sidekiq.redis do |r|
+            r.set(processed_flag_key, 'true', ex: CALLBACK_FLAG_TTL)
           end
-          
-          # Помечаем событие как обработанное (если батч существует)
-          # Это делается ДО обработки callbacks, чтобы защитить их от cleanup
-          if estatus.exists?
-            Sidekiq.redis { |r| r.hset(batch_key, event_name, 'true') }
+
+          # Если callbacks пусты - это нормально, если они не были зарегистрированы
+          # Мы всё равно вызываем Finalize для корректного cleanup
+          if callbacks.nil? || callbacks.empty?
+            Sidekiq.logger.debug "No callbacks registered for #{event_name} on batch #{bid}"
+            # Всё равно вызываем Finalize для корректного cleanup (если это не callback batch)
+            if !callback_batch
+              finalizer = Sidekiq::Batch::Callback::Finalize.new
+              status = Status.new bid
+              finalizer.dispatch(status, {"bid" => bid, "event" => event_name})
+            end
+            return
           end
 
           queue ||= "default"
@@ -343,12 +360,9 @@ module Sidekiq
 
           opts = {"bid" => bid, "event" => event_name}
           
-          # Удаляем callbacks после их чтения и постановки в очередь
+          # Удаляем callbacks после их чтения
           # Это безопасно, так как callbacks уже прочитаны и поставлены в очередь Sidekiq
-          # Они будут выполнены асинхронно, даже если ключи удалены из Redis
-          if !callbacks.empty?
-            Sidekiq.redis { |r| r.del(callback_key) }
-          end
+          Sidekiq.redis { |r| r.del(callback_key) }
 
           # Run callback batch finalize synchronously
           if callback_batch
@@ -356,7 +370,7 @@ module Sidekiq
             # Pass in stored event as callback finalize is processed on complete event
             cb_opts = callback_args.first&.at(2) || opts
 
-            Sidekiq.logger.debug {"Run callback batch bid: #{bid} event: #{event_name} args: #{callback_args.inspect}"}
+            Sidekiq.logger.debug {"Run callback batch bid: #{bid} event: #{event_name}"}
             # Finalize now
             finalizer = Sidekiq::Batch::Callback::Finalize.new
             status = Status.new bid
