@@ -14,6 +14,7 @@ require 'sidekiq/node_dsl'
 module Sidekiq
   class Batch
     class NoBlockGivenError < StandardError; end
+    class BatchAlreadyStartedError < StandardError; end
 
     BID_EXPIRE_TTL = 2_592_000
     
@@ -32,6 +33,8 @@ module Sidekiq
       @bidkey = "BID-" + @bid.to_s
       @queued_jids = []
       @pending_jids = []
+      @jobs_block = nil
+      @started = false
 
       @incremental_push = !Sidekiq.default_configuration[:batch_push_interval].nil?
       @batch_push_interval = Sidekiq.default_configuration[:batch_push_interval]
@@ -53,6 +56,7 @@ module Sidekiq
     end
 
     def on(event, callback, options = {})
+      raise BatchAlreadyStartedError, "Cannot add callbacks to a batch that has already been started" if @started
       return unless %w(success complete).include?(event.to_s)
       callback_key = "#{@bidkey}-callbacks-#{event}"
       Sidekiq.redis do |r|
@@ -66,8 +70,16 @@ module Sidekiq
       end
     end
 
-    def jobs
+    def add_jobs(&block)
       raise NoBlockGivenError unless block_given?
+      @jobs_block = block
+      self
+    end
+
+    def run
+      return [] unless @jobs_block
+      
+      @started = true
 
       bid_data, Thread.current[:bid_data] = Thread.current[:bid_data], []
 
@@ -96,7 +108,7 @@ module Sidekiq
           parent = Thread.current[:batch]
           Thread.current[:batch] = self
           Thread.current[:parent_bid] = parent_bid
-          yield
+          @jobs_block.call
         ensure
           Thread.current[:batch] = parent
           Thread.current[:parent_bid] = nil
@@ -392,9 +404,10 @@ module Sidekiq
             cb_batch.callback_batch = 'true'
             Sidekiq.logger.debug {"Adding callback batch: #{cb_batch.bid} for batch: #{bid}"}
             cb_batch.on(:complete, "Sidekiq::Batch::Callback::Finalize#dispatch", opts)
-            cb_batch.jobs do
+            cb_batch.add_jobs do
               push_callbacks callback_args, queue
             end
+            cb_batch.run
           end
         end
       end

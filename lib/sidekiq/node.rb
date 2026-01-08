@@ -60,12 +60,13 @@ module Sidekiq
       observer
       @batch = Sidekiq::Batch.new
 
-      @batch.jobs do
+      @batch.add_jobs do
         DummyJob.perform_async(desc) # Needed for not empty job list
         execute(*args, **kwargs)
       end
 
       @batch.on(:complete, self.class)
+      @batch.run
 
       s = Sidekiq::Batch::ExplicitStatus.new(@batch.bid)
       # Sidekiq.logger.info "#{Time.current.to_f} 🔥 EXISTS? #{s.exists?}".colorize(:red)

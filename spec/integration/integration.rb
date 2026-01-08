@@ -18,9 +18,10 @@ class TestWorker
   def perform
     Sidekiq.logger.info "Test Worker"
     if bid
-      batch.jobs do
+      batch.add_jobs do
         AnotherWorker.perform_async
       end
+      batch.run
     end
   end
 end
@@ -43,11 +44,12 @@ batch.on(:success, 'MyCallback#on_success', to: 'success@gmail.com')
 batch.on(:success, 'MyCallback#multi', to: 'success@gmail.com')
 batch.on(:complete, MyCallback, to: 'complete@gmail.com')
 
-batch.jobs do
+batch.add_jobs do
   10.times do
     TestWorker.perform_async
   end
 end
+batch.run
 puts Sidekiq::Batch::Status.new(batch.bid).data
 
 dump_redis_keys

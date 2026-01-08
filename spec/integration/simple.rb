@@ -11,9 +11,10 @@ class Worker1
   def perform
     Sidekiq.logger.info "Work1"
     batch = Sidekiq::Batch.new
-    batch.jobs do
+    batch.add_jobs do
       Worker2.perform_async
     end
+    batch.run
   end
 end
 
@@ -37,9 +38,10 @@ end
 batch = Sidekiq::Batch.new
 batch.on(:success, SomeClass)
 batch.on(:complete, SomeClass)
-batch.jobs do
+batch.add_jobs do
   Worker1.perform_async
 end
+batch.run
 
 puts "Overall bid #{batch.bid}"
 

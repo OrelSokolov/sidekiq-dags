@@ -19,7 +19,10 @@ describe Sidekiq::Batch::Status do
     end
 
     context 'when more than 0' do
-      before { batch.jobs do TestWorker.perform_async end }
+      before do
+        batch.add_jobs { TestWorker.perform_async }
+        batch.run
+      end
       it 'returns pending jobs' do
         expect(subject.pending).to eq(1)
       end
@@ -67,7 +70,10 @@ describe Sidekiq::Batch::Status do
     end
 
     context 'when more than 0' do
-      before { batch.jobs do TestWorker.perform_async end }
+      before do
+        batch.add_jobs { TestWorker.perform_async }
+        batch.run
+      end
 
       it 'returns failed jobs' do
         expect(subject.total).to eq(1)
@@ -84,7 +90,8 @@ describe Sidekiq::Batch::Status do
   describe '#created_at' do
     it 'returns time' do
       batch = Sidekiq::Batch.new
-      batch.jobs do TestWorker.perform_async end
+      batch.add_jobs { TestWorker.perform_async }
+      batch.run
       status = described_class.new(batch.bid)
       expect(status.created_at).not_to be_nil
     end

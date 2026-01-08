@@ -24,7 +24,10 @@ describe 'Batch flow' do
     before { batch.on(:complete, SampleCallback, :id => 42) }
     before { batch.description = 'describing the batch' }
     let(:status) { Sidekiq::Batch::Status.new(batch.bid) }
-    let(:jids) { batch.jobs do 3.times do TestWorker.perform_async end end }
+    let(:jids) do
+      batch.add_jobs { 3.times { TestWorker.perform_async } }
+      batch.run
+    end
     let(:queue) { Sidekiq::Queue.new }
 
     it 'correctly initializes' do
@@ -43,7 +46,8 @@ describe 'Batch flow' do
 
     it 'handles an empty batch' do
       batch = Sidekiq::Batch.new
-      jids = batch.jobs do nil end
+      batch.add_jobs { nil }
+      jids = batch.run
       expect(jids.size).to eq(0)
     end
   end
@@ -58,21 +62,27 @@ describe 'Batch flow' do
     let(:children) { [] }
 
     it 'handles a basic nested batch' do
-      batchA.jobs do
+      batchB.add_jobs do
+        jids << WorkerB.perform_async
+      end
+      
+      batchA.add_jobs do
         jids << WorkerA.perform_async
-        batchB.jobs do
-          jids << WorkerB.perform_async
-        end
+        batchB.run
         jids << WorkerA.perform_async
         children << batchB.bid
       end
+      batchA.run
 
-      batchC.jobs do
-        batchD.jobs do
-          jids << WorkerC.perform_async
-        end
+      batchD.add_jobs do
+        jids << WorkerC.perform_async
+      end
+      
+      batchC.add_jobs do
+        batchD.run
         children << batchD.bid
       end
+      batchC.run
 
       expect(jids.size).to eq(4)
       expect(Sidekiq::Batch::Status.new(parent).child_count).to eq(2)

@@ -69,12 +69,13 @@ describe "Race Condition Test with 1000 Empty Jobs" do
     job_count = 1000
     jids = []
     
-    batch.jobs do
+    batch.add_jobs do
       job_count.times do |i|
         jid = EmptyWorker.perform_async
         jids << jid
       end
     end
+    batch.run
     
     bid = batch.bid
     status = Sidekiq::Batch::Status.new(bid)
@@ -146,12 +147,13 @@ describe "Race Condition Test with 1000 Empty Jobs" do
     job_count = 1000
     jids = []
     
-    batch.jobs do
+    batch.add_jobs do
       job_count.times do
         jid = EmptyWorker.perform_async
         jids << jid
       end
     end
+    batch.run
     
     bid = batch.bid
     
@@ -211,12 +213,13 @@ describe "Race Condition Test with 1000 Empty Jobs" do
     job_count = 1000
     jids = []
     
-    batch.jobs do
+    batch.add_jobs do
       job_count.times do
         jid = EmptyWorker.perform_async
         jids << jid
       end
     end
+    batch.run
     
     bid = batch.bid
     

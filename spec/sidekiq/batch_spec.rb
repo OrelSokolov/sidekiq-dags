@@ -53,25 +53,71 @@ describe Sidekiq::Batch do
     end
   end
 
-  describe '#jobs' do
-    it 'throws error if no block given' do
-      expect { subject.jobs }.to raise_error Sidekiq::Batch::NoBlockGivenError
+  describe '#on' do
+    it 'allows adding callbacks before run' do
+      batch = Sidekiq::Batch.new
+      expect { batch.on(:complete, SampleCallback) }.not_to raise_error
     end
 
+    it 'raises error when adding callback to already started batch' do
+      batch = Sidekiq::Batch.new
+      batch.add_jobs { TestWorker.perform_async }
+      batch.run
+      
+      expect { batch.on(:complete, SampleCallback) }.to raise_error(
+        Sidekiq::Batch::BatchAlreadyStartedError,
+        "Cannot add callbacks to a batch that has already been started"
+      )
+    end
+
+    it 'raises error when adding callback after run even with empty batch' do
+      batch = Sidekiq::Batch.new
+      batch.add_jobs { nil }
+      batch.run
+      
+      expect { batch.on(:success, SampleCallback) }.to raise_error(
+        Sidekiq::Batch::BatchAlreadyStartedError
+      )
+    end
+  end
+
+  describe '#add_jobs' do
+    it 'throws error if no block given' do
+      expect { subject.add_jobs }.to raise_error Sidekiq::Batch::NoBlockGivenError
+    end
+
+    it 'does not execute block immediately' do
+      executed = false
+      batch = Sidekiq::Batch.new
+      batch.add_jobs do
+        executed = true
+      end
+      expect(executed).to be false
+    end
+
+    it 'returns self for chaining' do
+      batch = Sidekiq::Batch.new
+      result = batch.add_jobs { }
+      expect(result).to eq(batch)
+    end
+  end
+
+  describe '#run' do
     it 'increments to_process (when started)'
 
     it 'decrements to_process (when finished)'
-    # it 'calls process_successful_job to wait for block to finish' do
-    #   batch = Sidekiq::Batch.new
-    #   expect(Sidekiq::Batch).to receive(:process_successful_job).with(batch.bid)
-    #   batch.jobs {}
-    # end
 
     it 'sets Thread.current bid' do
       batch = Sidekiq::Batch.new
-      batch.jobs do
+      batch.add_jobs do
         expect(Thread.current[:batch]).to eq(batch)
       end
+      batch.run
+    end
+
+    it 'returns empty array if no jobs block was added' do
+      batch = Sidekiq::Batch.new
+      expect(batch.run).to eq([])
     end
   end
 
@@ -93,7 +139,8 @@ describe Sidekiq::Batch do
       allow(job).to receive(:was_performed)
 
       batch.invalidate_all
-      batch.jobs { job.perform }
+      batch.add_jobs { job.perform }
+      batch.run
 
       expect(job).not_to have_received(:was_performed)
     end
@@ -114,17 +161,16 @@ describe Sidekiq::Batch do
 
       it 'invalidates all job if parent batch is marked as invalidated' do
         batch_parent.invalidate_all
-        batch_parent.jobs do
-          [
-            job_of_parent.perform,
-            batch_child_1.jobs do
-              [
-                job_of_child_1.perform,
-                batch_child_2.jobs { job_of_child_2.perform }
-              ]
-            end
-          ]
+        batch_child_2.add_jobs { job_of_child_2.perform }
+        batch_child_1.add_jobs do
+          job_of_child_1.perform
+          batch_child_2.run
         end
+        batch_parent.add_jobs do
+          job_of_parent.perform
+          batch_child_1.run
+        end
+        batch_parent.run
 
         expect(job_of_parent).not_to have_received(:was_performed)
         expect(job_of_child_1).not_to have_received(:was_performed)
@@ -133,17 +179,16 @@ describe Sidekiq::Batch do
 
       it 'invalidates only requested batch' do
         batch_child_2.invalidate_all
-        batch_parent.jobs do
-          [
-            job_of_parent.perform,
-            batch_child_1.jobs do
-              [
-                job_of_child_1.perform,
-                batch_child_2.jobs { job_of_child_2.perform }
-              ]
-            end
-          ]
+        batch_child_2.add_jobs { job_of_child_2.perform }
+        batch_child_1.add_jobs do
+          job_of_child_1.perform
+          batch_child_2.run
         end
+        batch_parent.add_jobs do
+          job_of_parent.perform
+          batch_child_1.run
+        end
+        batch_parent.run
 
         expect(job_of_parent).to have_received(:was_performed)
         expect(job_of_child_1).to have_received(:was_performed)
@@ -184,7 +229,10 @@ describe Sidekiq::Batch do
     context 'complete' do
       before { batch.on(:complete, Object) }
       # before { batch.increment_job_queue(bid) }
-      before { batch.jobs do TestWorker.perform_async end }
+      before do
+        batch.add_jobs { TestWorker.perform_async }
+        batch.run
+      end
       before { Sidekiq::Batch.process_failed_job(bid, 'failed-job-id') }
 
       it 'tries to call complete callback' do
@@ -213,13 +261,15 @@ describe Sidekiq::Batch do
     let(:batch) { Sidekiq::Batch.new }
 
     it 'increments pending' do
-      batch.jobs do TestWorker.perform_async end
+      batch.add_jobs { TestWorker.perform_async }
+      batch.run
       pending = Sidekiq.redis { |r| r.hget("BID-#{batch.bid}", 'pending') }
       expect(pending).to eq('1')
     end
 
     it 'increments total' do
-      batch.jobs do TestWorker.perform_async end
+      batch.add_jobs { TestWorker.perform_async }
+      batch.run
       total = Sidekiq.redis { |r| r.hget("BID-#{batch.bid}", 'total') }
       expect(total).to eq('1')
     end
@@ -236,9 +286,10 @@ describe Sidekiq::Batch do
         it 'calls finalize which cleans up redis keys for success event' do
           batch = Sidekiq::Batch.new
           # Инициализируем батч, чтобы он существовал в Redis
-          batch.jobs do
+          batch.add_jobs do
             # Пустой блок - батч будет инициализирован
           end
+          batch.run
           # enqueue_callbacks вызывает Finalize#dispatch когда нет callbacks и батч существует
           # Finalize#dispatch вызывает cleanup_redis для success event
           # Может быть вызван cleanup для других batch тоже (parent batches, callback batches)

@@ -14,9 +14,10 @@ class Worker1
     Sidekiq.logger.info "Work1"
     batch = Sidekiq::Batch.new
     batch.on(:success, Worker2)
-    batch.jobs do
+    batch.add_jobs do
       Worker2.perform_async
     end
+    batch.run
   end
 end
 
@@ -27,9 +28,10 @@ class Worker2
     Sidekiq.logger.info "Work2"
     batch = Sidekiq::Batch.new
     batch.on(:success, Worker3)
-    batch.jobs do
+    batch.add_jobs do
       Worker3.perform_async
     end
+    batch.run
   end
 
   def on_success status, opts
@@ -44,9 +46,10 @@ class Worker3
     Sidekiq.logger.info "Work3"
     batch = Sidekiq::Batch.new
     batch.on(:success, Worker4)
-    batch.jobs do
+    batch.add_jobs do
       Worker4.perform_async
     end
+    batch.run
   end
 
   def on_success status, opts
@@ -78,9 +81,10 @@ end
 batch = Sidekiq::Batch.new
 batch.on(:success, SomeClass, 'uid' => 3)
 batch.on(:complete, SomeClass, 'uid' => 3)
-batch.jobs do
+batch.add_jobs do
   Worker1.perform_async
 end
+batch.run
 
 puts "Overall bid #{batch.bid}"
 
