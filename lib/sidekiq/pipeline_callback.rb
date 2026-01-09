@@ -67,15 +67,34 @@ module Sidekiq
         nil
       end
       
-      # Логируем информацию о батче
-      Sidekiq.logger.info "🔔 Batch callback #{event_type} for #{pipeline_name}::#{node_name} (bid: #{status.bid}, pending: #{batch_pending}, status.pending: #{status_pending})"
+      # Получаем количество failures для проверки
+      batch_failures = begin
+        status.failures
+      rescue => e
+        Sidekiq.logger.debug "⚠️ Could not get failures from batch status: #{e.message}"
+        []
+      end
       
-      # Если pending не nil и не 0, батч еще не завершен - игнорируем событие
-      # Это может произойти из-за race condition: sidekiq-batch проверил pending=0 и поставил
-      # коллбэк в очередь, но к моменту выполнения коллбэка pending уже изменился
+      # Проверяем, что failures - это массив
+      batch_failures = [] unless batch_failures.is_a?(Array)
+      failures_count = batch_failures.size
+      
+      # Логируем информацию о батче
+      Sidekiq.logger.info "🔔 Batch callback #{event_type} for #{pipeline_name}::#{node_name} (bid: #{status.bid}, pending: #{batch_pending}, status.pending: #{status_pending}, failures: #{failures_count})"
+      
+      # Если pending не nil и не 0, проверяем, не равен ли он количеству failures
+      # Если pending == failures, то это нормальная ситуация (все pending jobs - это failed jobs)
+      # Это НЕ race condition!
       if batch_pending && batch_pending > 0
-        Sidekiq.logger.warn "⏸️ Ignoring #{event_type} callback - batch #{status.bid} still has #{batch_pending} pending jobs (race condition detected)"
-        return
+        if batch_pending == failures_count
+          # Это нормально: pending == failures, все pending jobs - это failed jobs
+          Sidekiq.logger.info "✅ Batch #{status.bid} has #{batch_pending} pending jobs, but all are failures (#{failures_count}) - this is normal, not a race condition"
+        elsif batch_pending > failures_count
+          # Это race condition: pending > failures, значит есть еще работающие джобы
+          error_message = "⏸️ Ignoring #{event_type} callback - batch #{status.bid} still has #{batch_pending} pending jobs (#{failures_count} failures) (race condition detected)"
+          Sidekiq.logger.error error_message
+          raise RuntimeError, error_message
+        end
       end
       
       # Дополнительная проверка: если pending = nil, это может означать что батч еще не инициализирован
@@ -198,23 +217,23 @@ module Sidekiq
           Sidekiq.logger.debug "⚠️ Batch complete event ignored - node already #{node_record.status}"
         end
       end
+    rescue RuntimeError => e
+      # Пробрасываем RuntimeError дальше (для race condition detection в тестах)
+      raise
     rescue => e
       Sidekiq.logger.error "💥 Error in PipelineCallback for #{pipeline_name}::#{node_name}: #{e.message}"
       Sidekiq.logger.error e.backtrace.join("\n")
     end
 
     # Запускает следующую ноду пайплайна
-    # pipeline_name: например "testpipeline" (lowercase)
-    # node_name: например "PipelineStatusNode85"
+    # pipeline_name: например "bsight" (lowercase)
+    # node_name: например "RootNode"
     def trigger_next_node(pipeline_name, node_name)
-      # Проблема: pipeline_name в lowercase, но модуль может быть в CamelCase
-      # Решение: используем поиск класса по имени ноды во всех модулях
-      
-      # Ищем класс ноды по имени во всех модулях
-      current_node_class = find_node_class_by_name(node_name)
+      # Ищем класс ноды по имени в правильном модуле (используя pipeline_name)
+      current_node_class = find_node_class_by_name(node_name, pipeline_name)
       
       unless current_node_class
-        Sidekiq.logger.error "❌ Could not find node class with name: #{node_name}"
+        Sidekiq.logger.error "❌ Could not find node class with name: #{node_name} in pipeline: #{pipeline_name}"
         return
       end
       
@@ -225,6 +244,7 @@ module Sidekiq
         next_node_class = node_instance.next_node
         
         if next_node_class && (next_node_class.respond_to?(:present?) ? next_node_class.present? : !next_node_class.nil?)
+          puts "[MOVE TO THE NEXT NODE]"
           Sidekiq.logger.info "➡️ Triggering next node: #{next_node_class.name}"
           next_node_class.perform_async
         else
@@ -236,9 +256,33 @@ module Sidekiq
       end
     end
     
-    # Поиск класса ноды по имени (без учета модуля)
-    def find_node_class_by_name(node_name)
-      # Ищем во всех модулях верхнего уровня
+    # Поиск класса ноды по имени в конкретном модуле пайплайна
+    # pipeline_name: например "bsight" (lowercase)
+    # node_name: например "RootNode"
+    def find_node_class_by_name(node_name, pipeline_name = nil)
+      # Сначала пытаемся найти в конкретном модуле пайплайна
+      if pipeline_name
+        # Преобразуем pipeline_name в CamelCase (bsight -> Bsight, rustat -> Rustat)
+        module_name = pipeline_name.to_s.split('_').map(&:capitalize).join
+        
+        begin
+          # Пытаемся получить модуль по имени
+          if Object.const_defined?(module_name, false)
+            pipeline_module = Object.const_get(module_name, false)
+            if pipeline_module.is_a?(Module) && pipeline_module.const_defined?(node_name, false)
+              node_class = pipeline_module.const_get(node_name, false)
+              if node_class.is_a?(Class) && node_class < Sidekiq::Node
+                Sidekiq.logger.debug "Found node class in pipeline module: #{node_class.name}"
+                return node_class
+              end
+            end
+          end
+        rescue => e
+          Sidekiq.logger.debug "Error finding node in pipeline module #{module_name}: #{e.message}"
+        end
+      end
+      
+      # Fallback: ищем во всех модулях верхнего уровня (для совместимости)
       Object.constants.each do |const_name|
         begin
           const = Object.const_get(const_name)
@@ -249,7 +293,7 @@ module Sidekiq
             node_class = const.const_get(node_name, false)
             # Проверяем, что это класс и он наследуется от Sidekiq::Node
             if node_class.is_a?(Class) && node_class < Sidekiq::Node
-              Sidekiq.logger.debug "Found node class: #{node_class.name}"
+              Sidekiq.logger.debug "Found node class (fallback): #{node_class.name}"
               return node_class
             end
           end

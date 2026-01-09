@@ -7,8 +7,17 @@ module Sidekiq
     include Sidekiq::Batch::Callback
 
     def self.execute &block
-      define_method(:execute) do
-        instance_exec(&block)
+      define_method(:execute) do |*args, **kwargs|
+        # Проверяем arity блока чтобы решить как вызывать
+        # arity = 0 означает блок не принимает аргументы
+        # arity < 0 означает блок принимает переменное число аргументов (*args)
+        if block.arity == 0
+          # Блок не принимает аргументы - вызываем без них
+          instance_exec(&block)
+        else
+          # Блок принимает аргументы или использует *args
+          instance_exec(*args, **kwargs, &block)
+        end
       end
     end
 
@@ -81,8 +90,11 @@ module Sidekiq
       @batch = Sidekiq::Batch.new
 
       @batch.add_jobs do
-        DummyJob.perform_async(desc) # Needed for not empty job list
+        # ВАЖНО: execute ПЕРВЫМ, чтобы все реальные джобы были зарегистрированы
+        # до DummyJob. Иначе DummyJob может завершиться раньше, чем реальные джобы
+        # будут добавлены в batch, вызывая race condition.
         execute(*args, **kwargs)
+        DummyJob.perform_async(desc) # Нужен для гарантии непустого batch
       end
 
       # Регистрируем callback для отслеживания статусов пайплайна
@@ -112,7 +124,7 @@ module Sidekiq
       # Sidekiq.logger.info s.data.to_s.colorize(:light_yellow)
 
       desc_str = desc
-      desc_str = desc_str.present? if desc_str.respond_to?(:present?)
+      desc_str = nil if desc_str.respond_to?(:present?) && !desc_str.present?
       desc_str = desc if desc_str.nil? || (desc_str.respond_to?(:empty?) && desc_str.empty?)
       notify_all "➡️ #{desc_str || self.class} -> (#{s.total})    | #{@batch.bid}"
     end
@@ -122,7 +134,7 @@ module Sidekiq
       # Sidekiq.logger.info status.data.to_s.colorize(:yellow)
 
       desc_str = desc
-      desc_str = desc_str.present? if desc_str.respond_to?(:present?)
+      desc_str = nil if desc_str.respond_to?(:present?) && !desc_str.present?
       desc_str = desc if desc_str.nil? || (desc_str.respond_to?(:empty?) && desc_str.empty?)
       notify_all "✔️ #{desc_str || self.class} (#{status.total})   |  #{status.bid}"
       
@@ -133,6 +145,11 @@ module Sidekiq
       else
         notify_all "✅ Конец графа #{sidekiq_queue}."
       end
+    end
+
+    # Дефолтный execute для нод без execute блока
+    def execute(*args, **kwargs)
+      # Пустая реализация - ноды могут работать без execute
     end
 
     private

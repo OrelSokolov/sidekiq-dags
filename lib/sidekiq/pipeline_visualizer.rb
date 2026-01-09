@@ -144,38 +144,38 @@ module Sidekiq
             <defs>
               <style>
                 .node-rect { 
-                  fill: #{colors[name] || '#95A5A6'}; 
+                  fill: #{colors[name] || '#f8f9fa'}; 
                   stroke: #2C3E50; 
                   stroke-width: 1;
                 }
                 .node-rect-running { 
-                  fill: #0d6efd; 
+                  fill: #80c7ff; 
                   stroke: #0a58ca; 
                   stroke-width: 3;
                   filter: drop-shadow(3px 3px 6px rgba(13,110,253,0.4));
                 }
                 .node-rect-completed { 
-                  fill: #FFD700; 
+                  fill: #fff3cd; 
                   stroke: #FFA500; 
                   stroke-width: 2;
                   filter: drop-shadow(2px 2px 4px rgba(255,215,0,0.3));
                 }
                 .node-text { 
-                  fill: white; 
+                  fill: #000000; 
                   font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
                   font-size: 18px; 
                   font-weight: bold;
                   text-anchor: middle;
                 }
                 .node-text-running { 
-                  fill: #ffffff; 
+                  fill: #000000; 
                   font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
                   font-size: 18px; 
                   font-weight: bold;
                   text-anchor: middle;
                 }
                 .node-text-completed { 
-                  fill: #8B4513; 
+                  fill: #000000; 
                   font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
                   font-size: 18px; 
                   font-weight: bold;
@@ -188,14 +188,14 @@ module Sidekiq
                   text-anchor: middle;
                 }
                 .node-desc-running { 
-                  fill: #e7f1ff; 
+                  fill: #000000; 
                   font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
                   font-size: 12px; 
                   font-weight: bold;
                   text-anchor: middle;
                 }
                 .node-desc-completed { 
-                  fill: #654321; 
+                  fill: #000000; 
                   font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
                   font-size: 12px; 
                   font-weight: bold;
@@ -208,14 +208,14 @@ module Sidekiq
                   text-anchor: start;
                 }
                 .job-text-running { 
-                  fill: #e7f1ff; 
+                  fill: #000000; 
                   font-family: 'Consolas', 'Monaco', monospace; 
                   font-size: 10px; 
                   font-weight: bold;
                   text-anchor: start;
                 }
                 .job-text-completed { 
-                  fill: #8B4513; 
+                  fill: #000000; 
                   font-family: 'Consolas', 'Monaco', monospace; 
                   font-size: 10px; 
                   font-weight: bold;
@@ -227,12 +227,12 @@ module Sidekiq
                   opacity: 1;
                 }
                 .separator-line-running {
-                  stroke: #e7f1ff;
+                  stroke: #000;
                   stroke-width: 2;
                   opacity: 1;
                 }
                 .separator-line-completed {
-                  stroke: #8B4513;
+                  stroke: #000;
                   stroke-width: 2;
                   opacity: 1;
                 }

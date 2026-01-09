@@ -26,18 +26,21 @@ module Sidekiq
 
     # Отметить начало выполнения ноды
     def start!
+      puts "[SET STATUS]"
       update!(status: :running, run_at: Time.current, error_message: nil)
       Sidekiq.logger.info "▶️ Node #{full_name} started"
     end
 
     # Отметить успешное завершение ноды
     def complete!
+      puts "[SET STATUS]"
       update!(status: :completed)
       Sidekiq.logger.info "✅ Node #{full_name} completed"
     end
 
     # Отметить ошибку в ноде
     def fail!(error = nil)
+      puts "[SET STATUS]"
       error_msg = error.to_s
       error_msg = error_msg[0..999] if error_msg.length > 1000
       update!(status: :failed, error_message: error_msg)
@@ -46,6 +49,7 @@ module Sidekiq
 
     # Пропустить ноду
     def skip!
+      puts "[SET STATUS]"
       update!(status: :skipped)
       Sidekiq.logger.info "⏭️ Node #{full_name} skipped"
     end

@@ -75,16 +75,11 @@ module Sidekiq
       sidekiq_pipeline_nodes.where(status: :failed).exists?
     end
 
-    # Проверить в режиме ожидания (нет running/completed/failed нод, только pending или пусто)
+    # Проверить в режиме ожидания
+    # Пайплайн idle если НЕТ running нод И НЕТ задач в очереди
+    # Статус определяется динамически, не зависит от completed/failed нод
     def idle?
-      return false if has_jobs_in_queue?
-      return true if sidekiq_pipeline_nodes.empty?
-      # Если есть running ноды, пайплайн не idle
-      return false if sidekiq_pipeline_nodes.where(status: :running).exists?
-      # Если есть completed или failed ноды, пайплайн не idle
-      return false if sidekiq_pipeline_nodes.where(status: [:completed, :failed]).exists?
-      # Если все ноды pending, пайплайн idle
-      true
+      !running?
     end
 
     # Проверить запущен ли пайплайн (алиас для running?)
