@@ -5,6 +5,7 @@ class CreateSidekiqPipelineNodes < ActiveRecord::Migration[7.0]
     create_table :sidekiq_pipeline_nodes do |t|
       t.references :sidekiq_pipeline, null: false, foreign_key: { to_table: :sidekiq_pipelines }
       t.string :node_name, null: false
+      t.string :bid
       t.integer :status, default: 0, null: false
       t.datetime :run_at
       t.text :error_message
@@ -16,4 +17,3 @@ class CreateSidekiqPipelineNodes < ActiveRecord::Migration[7.0]
     add_index :sidekiq_pipeline_nodes, :status
   end
 end
-

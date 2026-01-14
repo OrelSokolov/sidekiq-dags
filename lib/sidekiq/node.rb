@@ -80,14 +80,17 @@ module Sidekiq
 
     def perform(*args, **kwargs)
       observer
-      
+
       # Отслеживание начала ноды (если включен PipelineTracking)
       if respond_to?(:mark_node_started!)
         started = mark_node_started!
         return unless started # Если пайплайн уже запущен, не запускаем ноду
       end
-      
+
       @batch = Sidekiq::Batch.new
+
+      # Сохраняем BID в базу данных для отслеживания прогресса
+      save_bid_to_database!(@batch.bid)
 
       @batch.add_jobs do
         # ВАЖНО: execute ПЕРВЫМ, чтобы все реальные джобы были зарегистрированы
@@ -137,7 +140,7 @@ module Sidekiq
       desc_str = nil if desc_str.respond_to?(:present?) && !desc_str.present?
       desc_str = desc if desc_str.nil? || (desc_str.respond_to?(:empty?) && desc_str.empty?)
       notify_all "✔️ #{desc_str || self.class} (#{status.total})   |  #{status.bid}"
-      
+
       next_node_class = next_node
       if next_node_class && (next_node_class.respond_to?(:present?) ? next_node_class.present? : !next_node_class.nil?)
         notify_all "➕ #{next_node_class} "
@@ -153,6 +156,27 @@ module Sidekiq
     end
 
     private
+
+    # Сохраняет BID текущего батча в базу данных для ноды
+    def save_bid_to_database!(bid)
+      return unless defined?(SidekiqPipelineNode) && SidekiqPipelineNode.table_exists?
+
+      begin
+        if respond_to?(:pipeline_name) && respond_to?(:node_name)
+          pipeline_name = self.pipeline_name
+          node_name = self.node_name
+
+          node_record = SidekiqPipelineNode.for(pipeline_name, node_name)
+          return unless node_record
+
+          # Обновляем BID для ноды
+          node_record.update_column(:bid, bid)
+          Sidekiq.logger.debug "💾 Saved BID #{bid} to database for #{pipeline_name}::#{node_name}"
+        end
+      rescue => e
+        Sidekiq.logger.warn "⚠️ Failed to save BID #{bid} to database: #{e.message}"
+      end
+    end
 
     def notify_all(msg)
       prefix = "[#{sidekiq_queue}] "
