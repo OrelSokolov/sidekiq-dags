@@ -22,7 +22,7 @@ begin
   require 'sidekiq/pipeline_tracking'
 rescue LoadError
   # ActiveRecord не доступен, пропускаем загрузку pipeline компонентов
-  Sidekiq.logger.debug "ActiveRecord not available, pipeline tracking disabled" if defined?(Sidekiq.logger)
+  Sidekiq.logger.debug 'ActiveRecord not available, pipeline tracking disabled' if defined?(Sidekiq.logger)
 end
 
 module Sidekiq
@@ -31,7 +31,7 @@ module Sidekiq
     class BatchAlreadyStartedError < StandardError; end
 
     BID_EXPIRE_TTL = 2_592_000
-    
+
     # TTL для флагов обработки callbacks (24 часа)
     # Флаги хранятся отдельно от основного батча и гарантируют идемпотентность
     # даже после cleanup основного батча
@@ -41,10 +41,10 @@ module Sidekiq
 
     def initialize(existing_bid = nil)
       @bid = existing_bid || SecureRandom.urlsafe_base64(10)
-      @existing = !(!existing_bid || existing_bid.empty?)  # Basically existing_bid.present?
+      @existing = !(!existing_bid || existing_bid.empty?) # Basically existing_bid.present?
       @initialized = false
       @created_at = Time.now.utc.to_f
-      @bidkey = "BID-" + @bid.to_s
+      @bidkey = 'BID-' + @bid.to_s
       @queued_jids = []
       @pending_jids = []
       @jobs_block = nil
@@ -70,15 +70,16 @@ module Sidekiq
     end
 
     def on(event, callback, options = {})
-      raise BatchAlreadyStartedError, "Cannot add callbacks to a batch that has already been started" if @started
-      return unless %w(success complete).include?(event.to_s)
+      raise BatchAlreadyStartedError, 'Cannot add callbacks to a batch that has already been started' if @started
+      return unless %w[success complete].include?(event.to_s)
+
       callback_key = "#{@bidkey}-callbacks-#{event}"
       Sidekiq.redis do |r|
         r.multi do |pipeline|
           pipeline.sadd(callback_key, [JSON.unparse({
-            callback: callback,
-            opts: options
-          })])
+                                                      callback: callback,
+                                                      opts: options
+                                                    })])
           pipeline.expire(callback_key, BID_EXPIRE_TTL)
         end
       end
@@ -86,16 +87,18 @@ module Sidekiq
 
     def add_jobs(&block)
       raise NoBlockGivenError unless block_given?
+
       @jobs_block = block
       self
     end
 
     def run
       return [] unless @jobs_block
-      
+
       @started = true
 
-      bid_data, Thread.current[:bid_data] = Thread.current[:bid_data], []
+      bid_data = Thread.current[:bid_data]
+      Thread.current[:bid_data] = []
 
       begin
         if !@existing && !@initialized
@@ -103,11 +106,11 @@ module Sidekiq
 
           Sidekiq.redis do |r|
             r.multi do |pipeline|
-              pipeline.hset(@bidkey, "created_at", @created_at)
+              pipeline.hset(@bidkey, 'created_at', @created_at)
               pipeline.expire(@bidkey, BID_EXPIRE_TTL)
               if parent_bid
-                pipeline.hset(@bidkey, "parent_bid", parent_bid.to_s)
-                pipeline.hincrby("BID-#{parent_bid}", "children", 1)
+                pipeline.hset(@bidkey, 'parent_bid', parent_bid.to_s)
+                pipeline.hincrby("BID-#{parent_bid}", 'children', 1)
               end
             end
           end
@@ -132,26 +135,25 @@ module Sidekiq
         # и вызвать callbacks, если они есть
         if @queued_jids.size == 0
           # Получаем parent_bid из Redis, так как он может быть установлен при инициализации
-          stored_parent_bid = Sidekiq.redis { |r| r.hget(@bidkey, "parent_bid") }
+          stored_parent_bid = Sidekiq.redis { |r| r.hget(@bidkey, 'parent_bid') }
           stored_parent_bid = nil if stored_parent_bid && stored_parent_bid.empty?
-          
-          # Устанавливаем pending=0 и total=0 для пустого батча
+
+          # Устанавливаем pending=0, total=0 и done=0 для пустого батча
           Sidekiq.redis do |r|
             r.multi do |pipeline|
-              pipeline.hset(@bidkey, "pending", "0")
-              pipeline.hset(@bidkey, "total", "0")
+              pipeline.hset(@bidkey, 'pending', '0')
+              pipeline.hset(@bidkey, 'total', '0')
+              pipeline.hset(@bidkey, 'done', '0')
               pipeline.expire(@bidkey, BID_EXPIRE_TTL)
-              
-              if stored_parent_bid
-                pipeline.expire("BID-#{stored_parent_bid}", BID_EXPIRE_TTL)
-              end
+
+              pipeline.expire("BID-#{stored_parent_bid}", BID_EXPIRE_TTL) if stored_parent_bid
             end
           end
-          
+
           # Проверяем, есть ли callbacks для этого батча
           has_complete_callback = Sidekiq.redis { |r| r.scard("#{@bidkey}-callbacks-complete") } > 0
           has_success_callback = Sidekiq.redis { |r| r.scard("#{@bidkey}-callbacks-success") } > 0
-          
+
           # Если есть callbacks, вызываем их
           # Для пустого батча без ошибок: complete и success вызываются одновременно
           if has_complete_callback || has_success_callback
@@ -159,22 +161,20 @@ module Sidekiq
             self.class.enqueue_callbacks(:complete, @bid)
             self.class.enqueue_callbacks(:success, @bid) if has_success_callback
           end
-          
+
           return []
         end
-        
+
         conditional_redis_increment!(true)
 
         Sidekiq.redis do |r|
           r.multi do |pipeline|
-            if parent_bid
-              pipeline.expire("BID-#{parent_bid}", BID_EXPIRE_TTL)
-            end
+            pipeline.expire("BID-#{parent_bid}", BID_EXPIRE_TTL) if parent_bid
 
             pipeline.expire(@bidkey, BID_EXPIRE_TTL)
 
-            pipeline.sadd(@bidkey + "-jids", @queued_jids)
-            pipeline.expire(@bidkey + "-jids", BID_EXPIRE_TTL)
+            pipeline.sadd(@bidkey + '-jids', @queued_jids)
+            pipeline.expire(@bidkey + '-jids', BID_EXPIRE_TTL)
           end
         end
 
@@ -190,34 +190,35 @@ module Sidekiq
       conditional_redis_increment!
     end
 
-    def conditional_redis_increment!(force=false)
-      if should_increment? || force
-        parent_bid = Thread.current[:parent_bid]
-        Sidekiq.redis do |r|
-          r.multi do |pipeline|
-            if parent_bid
-              pipeline.hincrby("BID-#{parent_bid}", "total", @pending_jids.length)
-              pipeline.expire("BID-#{parent_bid}", BID_EXPIRE_TTL)
-            end
+    def conditional_redis_increment!(force = false)
+      return unless should_increment? || force
 
-            pipeline.hincrby(@bidkey, "pending", @pending_jids.length)
-            pipeline.hincrby(@bidkey, "total", @pending_jids.length)
-            pipeline.expire(@bidkey, BID_EXPIRE_TTL)
+      parent_bid = Thread.current[:parent_bid]
+      Sidekiq.redis do |r|
+        r.multi do |pipeline|
+          if parent_bid
+            pipeline.hincrby("BID-#{parent_bid}", 'total', @pending_jids.length)
+            pipeline.expire("BID-#{parent_bid}", BID_EXPIRE_TTL)
           end
+
+          pipeline.hincrby(@bidkey, 'pending', @pending_jids.length)
+          pipeline.hincrby(@bidkey, 'total', @pending_jids.length)
+          pipeline.expire(@bidkey, BID_EXPIRE_TTL)
         end
-        @pending_jids = []
       end
+      @pending_jids = []
     end
 
     def should_increment?
       return false unless @incremental_push
       return true if @batch_push_interval == 0 || @queued_jids.length == 1
+
       now = Time.now.to_f
       @last_increment ||= now
-      if @last_increment + @batch_push_interval > now
-        @last_increment = now
-        return true
-      end
+      return unless @last_increment + @batch_push_interval > now
+
+      @last_increment = now
+      true
     end
 
     def invalidate_all
@@ -231,14 +232,14 @@ module Sidekiq
 
     def parent_bid
       Sidekiq.redis do |r|
-        r.hget(@bidkey, "parent_bid")
+        r.hget(@bidkey, 'parent_bid')
       end
     end
 
     def parent
-      if parent_bid
-        Sidekiq::Batch.new(parent_bid)
-      end
+      return unless parent_bid
+
+      Sidekiq::Batch.new(parent_bid)
     end
 
     def valid?(batch = self)
@@ -265,11 +266,11 @@ module Sidekiq
             r.multi do |pipeline|
               pipeline.sadd("BID-#{bid}-failed", [jid])
 
-              pipeline.hincrby("BID-#{bid}", "pending", 0)
+              pipeline.hincrby("BID-#{bid}", 'pending', 0)
               pipeline.scard("BID-#{bid}-failed")
-              pipeline.hincrby("BID-#{bid}", "children", 0)
+              pipeline.hincrby("BID-#{bid}", 'children', 0)
               pipeline.scard("BID-#{bid}-complete")
-              pipeline.hget("BID-#{bid}", "parent_bid")
+              pipeline.hget("BID-#{bid}", 'parent_bid')
 
               pipeline.expire("BID-#{bid}-failed", BID_EXPIRE_TTL)
             end
@@ -279,16 +280,14 @@ module Sidekiq
           if parent_bid
             Sidekiq.redis do |r|
               r.multi do |pipeline|
-                pipeline.hincrby("BID-#{parent_bid}", "pending", 1)
+                pipeline.hincrby("BID-#{parent_bid}", 'pending', 1)
                 pipeline.sadd("BID-#{parent_bid}-failed", [jid])
                 pipeline.expire("BID-#{parent_bid}-failed", BID_EXPIRE_TTL)
               end
             end
           end
 
-          if pending.to_i == failed.to_i && children == complete
-            enqueue_callbacks(:complete, bid)
-          end
+          enqueue_callbacks(:complete, bid) if pending.to_i == failed.to_i && children == complete
         end
       end
 
@@ -297,23 +296,25 @@ module Sidekiq
         # Без lock'а несколько потоков могут одновременно декрементировать pending,
         # и batch может быть cleanup'нут до того, как все потоки завершат обработку
         with_redis_lock("batch-lock-#{bid}", timeout: 5) do
-          Sidekiq.logger.info "PENDING: #{Sidekiq.redis { |r| r.hget("BID-#{bid}", 'pending')} } ".colorize(:light_yellow)
-
-          failed, pending, children, complete, success, total, parent_bid = Sidekiq.redis do |r|
+          failed, pending, done, children, complete, success, = Sidekiq.redis do |r|
             r.multi do |pipeline|
               pipeline.scard("BID-#{bid}-failed")
-              pipeline.hincrby("BID-#{bid}", "pending", -1)
-              pipeline.hincrby("BID-#{bid}", "children", 0)
+              pipeline.hincrby("BID-#{bid}", 'pending', -1)
+              pipeline.hincrby("BID-#{bid}", 'done', 1)
+              pipeline.hincrby("BID-#{bid}", 'children', 0)
               pipeline.scard("BID-#{bid}-complete")
               pipeline.scard("BID-#{bid}-success")
-              pipeline.hget("BID-#{bid}", "total")
-              pipeline.hget("BID-#{bid}", "parent_bid")
+              pipeline.hget("BID-#{bid}", 'total')
+              pipeline.hget("BID-#{bid}", 'parent_bid')
 
               pipeline.srem("BID-#{bid}-failed", [jid])
               pipeline.srem("BID-#{bid}-jids", [jid])
               pipeline.expire("BID-#{bid}", BID_EXPIRE_TTL)
             end
           end
+
+          max = pending.to_i + done.to_i
+          Sidekiq.logger.info "PENDING: #{pending} ".colorize(:light_yellow) + "DONE: #{done} ".colorize(:green) + "MAX: #{max} ".colorize(:blue)
 
           all_success = pending.to_i.zero? && children == success
           # if complete or successfull call complete callback (the complete callback may then call successful)
@@ -330,67 +331,63 @@ module Sidekiq
         event_name = event.to_s
         batch_key = "BID-#{bid}"
         callback_key = "#{batch_key}-callbacks-#{event_name}"
-        
+
         # ОТДЕЛЬНЫЙ ключ для флага обработки - НЕ удаляется при cleanup!
         # Это гарантирует идемпотентность даже после удаления батча
         processed_flag_key = "#{batch_key}-processed-#{event_name}"
-        
+
         # АТОМАРНАЯ ОПЕРАЦИЯ: используем Redis lock для атомарного чтения и пометки
         with_redis_lock("callback-lock-#{bid}-#{event_name}", timeout: 5) do
           # Проверяем флаг обработки в ОТДЕЛЬНОМ ключе (не удаляется при cleanup)
           already_processed = Sidekiq.redis { |r| r.get(processed_flag_key) }
-          
+
           if already_processed == 'true'
             Sidekiq.logger.debug "Callback #{event_name} for batch #{bid} already processed, skipping"
             return
           end
-          
+
           # КРИТИЧЕСКАЯ ПРОВЕРКА: callback не должен выполняться, пока pending > 0
           # Это гарантирует синхронизацию - callback выполнится только после завершения всех джобов
           pending, children, complete, success, failed = Sidekiq.redis do |r|
             r.multi do |pipeline|
-              pipeline.hget(batch_key, "pending")
-              pipeline.hget(batch_key, "children")
+              pipeline.hget(batch_key, 'pending')
+              pipeline.hget(batch_key, 'children')
               pipeline.scard("#{batch_key}-complete")
               pipeline.scard("#{batch_key}-success")
               pipeline.scard("#{batch_key}-failed")
             end
           end
-          
+
           pending = pending.to_i
           children = children.to_i
           complete = complete.to_i
           success = success.to_i
           failed = failed.to_i
-          
+
           # Для complete callback: pending должен быть равен failed (все джобы завершены или провалены)
           # И все дочерние батчи должны быть завершены (children == complete)
-          if event_name == 'complete'
-            if pending != failed || children != complete
-              Sidekiq.logger.debug "Callback #{event_name} for batch #{bid} skipped: pending=#{pending}, failed=#{failed}, children=#{children}, complete=#{complete}"
-              return
-            end
+          if (event_name == 'complete') && (pending != failed || children != complete)
+            Sidekiq.logger.debug "Callback #{event_name} for batch #{bid} skipped: pending=#{pending}, failed=#{failed}, children=#{children}, complete=#{complete}"
+            return
           end
-          
+
           # Для success callback: pending должен быть 0 И все дочерние батчи успешны (children == success)
-          if event_name == 'success'
-            if pending != 0 || children != success
-              Sidekiq.logger.debug "Callback #{event_name} for batch #{bid} skipped: pending=#{pending}, children=#{children}, success=#{success}"
-              return
-            end
+          if (event_name == 'success') && (pending != 0 || children != success)
+            Sidekiq.logger.debug "Callback #{event_name} for batch #{bid} skipped: pending=#{pending}, children=#{children}, success=#{success}"
+            return
           end
-          
+
           callbacks, queue, parent_bid, callback_batch = Sidekiq.redis do |r|
             r.multi do |pipeline|
               # Читаем callbacks (даже если батч уже удален, callbacks могут еще существовать)
               pipeline.smembers(callback_key)
               # Читаем метаданные батча
-              pipeline.hget(batch_key, "callback_queue")
-              pipeline.hget(batch_key, "parent_bid")
-              pipeline.hget(batch_key, "callback_batch")
+              pipeline.hget(batch_key, 'callback_queue')
+              pipeline.hget(batch_key, 'parent_bid')
+              pipeline.hget(batch_key, 'callback_batch')
             end
           end
-          
+
           # СРАЗУ помечаем событие как обработанное в ОТДЕЛЬНОМ ключе с TTL
           # Это предотвращает race condition и гарантирует идемпотентность
           # Даже если батч будет удален, флаг останется на 24 часа
@@ -403,24 +400,24 @@ module Sidekiq
           if callbacks.nil? || callbacks.empty?
             Sidekiq.logger.debug "No callbacks registered for #{event_name} on batch #{bid}"
             # Всё равно вызываем Finalize для корректного cleanup (если это не callback batch)
-            if !callback_batch
+            unless callback_batch
               finalizer = Sidekiq::Batch::Callback::Finalize.new
               status = Status.new bid
-              finalizer.dispatch(status, {"bid" => bid, "event" => event_name})
+              finalizer.dispatch(status, { 'bid' => bid, 'event' => event_name })
             end
             return
           end
 
-          queue ||= "default"
-          parent_bid = !parent_bid || parent_bid.empty? ? nil : parent_bid    # Basically parent_bid.blank?
+          queue ||= 'default'
+          parent_bid = !parent_bid || parent_bid.empty? ? nil : parent_bid # Basically parent_bid.blank?
           callback_args = callbacks.reduce([]) do |memo, jcb|
             cb = Sidekiq.load_json(jcb)
             serialized_status = Sidekiq::Batch::FinalStatusSnapshot.new(bid).serialized
             memo << [cb['callback'], event_name, cb['opts'], bid, parent_bid, serialized_status]
           end
 
-          opts = {"bid" => bid, "event" => event_name}
-          
+          opts = { 'bid' => bid, 'event' => event_name }
+
           # Удаляем callbacks после их чтения
           # Это безопасно, так как callbacks уже прочитаны и поставлены в очередь Sidekiq
           Sidekiq.redis { |r| r.del(callback_key) }
@@ -431,7 +428,7 @@ module Sidekiq
             # Pass in stored event as callback finalize is processed on complete event
             cb_opts = callback_args.first&.at(2) || opts
 
-            Sidekiq.logger.debug {"Run callback batch bid: #{bid} event: #{event_name}"}
+            Sidekiq.logger.debug { "Run callback batch bid: #{bid} event: #{event_name}" }
             # Finalize now
             finalizer = Sidekiq::Batch::Callback::Finalize.new
             status = Status.new bid
@@ -440,7 +437,7 @@ module Sidekiq
             return
           end
 
-          Sidekiq.logger.debug {"Enqueue callback bid: #{bid} event: #{event_name} args: #{callback_args.inspect}"}
+          Sidekiq.logger.debug { "Enqueue callback bid: #{bid} event: #{event_name} args: #{callback_args.inspect}" }
 
           if callback_args.empty?
             # Finalize now
@@ -449,10 +446,10 @@ module Sidekiq
             finalizer.dispatch(status, opts)
           else
             # Otherwise finalize in sub batch complete callback
-            cb_batch = self.new
+            cb_batch = new
             cb_batch.callback_batch = 'true'
-            Sidekiq.logger.debug {"Adding callback batch: #{cb_batch.bid} for batch: #{bid}"}
-            cb_batch.on(:complete, "Sidekiq::Batch::Callback::Finalize#dispatch", opts)
+            Sidekiq.logger.debug { "Adding callback batch: #{cb_batch.bid} for batch: #{bid}" }
+            cb_batch.on(:complete, 'Sidekiq::Batch::Callback::Finalize#dispatch', opts)
             cb_batch.add_jobs do
               push_callbacks callback_args, queue
             end
@@ -462,8 +459,8 @@ module Sidekiq
       end
 
       def cleanup_redis(bid)
-        Sidekiq.logger.info {"Cleaning redis of batch #{bid}".colorize(:blue) }
-        
+        Sidekiq.logger.info { "Cleaning redis of batch #{bid}".colorize(:blue) }
+
         # Удаляем только основные ключи батча, НЕ удаляем callbacks
         # Callbacks могут быть еще в очереди Sidekiq и не выполнены
         # Callbacks удалятся автоматически по TTL (30 дней) или когда будут обработаны
@@ -472,19 +469,19 @@ module Sidekiq
           "BID-#{bid}-failed",
           "BID-#{bid}-success",
           "BID-#{bid}-complete",
-          "BID-#{bid}-jids",
+          "BID-#{bid}-jids"
         ]
-        
+
         Sidekiq.redis do |r|
           r.del(*keys_to_delete)
         end
-        
+
         # Callbacks НЕ удаляем - они могут быть еще не выполнены
         # Они будут удалены по TTL или когда enqueue_callbacks их обработает
         # Это гарантирует, что callbacks не будут потеряны даже если батч удален
       end
 
-    private
+      private
 
       def with_redis_lock(lock_key, timeout: 30, max_wait: 60)
         # Генерируем уникальный токен для этого lock'а
@@ -525,12 +522,14 @@ module Sidekiq
         end
       end
 
-      def push_callbacks args, queue
+      def push_callbacks(args, queue)
+        return if args.empty?
+
         Sidekiq::Client.push_bulk(
           'class' => Sidekiq::Batch::Callback::Worker,
           'args' => args,
           'queue' => queue
-        ) unless args.empty?
+        )
       end
     end
   end

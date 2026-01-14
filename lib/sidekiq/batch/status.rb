@@ -8,7 +8,7 @@ module Sidekiq
       end
 
       def join
-        raise "Not supported"
+        raise 'Not supported'
       end
 
       def pending
@@ -27,8 +27,16 @@ module Sidekiq
         Sidekiq.redis { |r| r.hget("BID-#{bid}", 'total') }.to_i
       end
 
+      def done
+        Sidekiq.redis { |r| r.hget("BID-#{bid}", 'done') }.to_i
+      end
+
+      def max
+        pending + done
+      end
+
       def parent_bid
-        Sidekiq.redis { |r| r.hget("BID-#{bid}", "parent_bid") }
+        Sidekiq.redis { |r| r.hget("BID-#{bid}", 'parent_bid') }
       end
 
       def failure_info
@@ -49,6 +57,8 @@ module Sidekiq
           total: total,
           failures: failures,
           pending: pending,
+          done: done,
+          max: max,
           created_at: created_at,
           complete: complete?,
           failure_info: failure_info,
