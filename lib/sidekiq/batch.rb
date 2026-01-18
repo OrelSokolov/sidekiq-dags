@@ -262,17 +262,24 @@ module Sidekiq
       def process_failed_job(bid, jid)
         # Используем тот же lock что и для successful jobs для консистентности
         with_redis_lock("batch-lock-#{bid}", timeout: 5) do
-          _, pending, failed, children, complete, parent_bid = Sidekiq.redis do |r|
+          # Сначала добавляем JID в failed set и обновляем TTL
+          Sidekiq.redis do |r|
             r.multi do |pipeline|
               pipeline.sadd("BID-#{bid}-failed", [jid])
+              pipeline.expire("BID-#{bid}-failed", BID_EXPIRE_TTL)
+            end
+          end
 
+          # Затем читаем состояние батча ПОСЛЕ добавления JID
+          pending, failed, children, complete, parent_bid, total, done = Sidekiq.redis do |r|
+            r.multi do |pipeline|
               pipeline.hincrby("BID-#{bid}", 'pending', 0)
               pipeline.scard("BID-#{bid}-failed")
               pipeline.hincrby("BID-#{bid}", 'children', 0)
               pipeline.scard("BID-#{bid}-complete")
               pipeline.hget("BID-#{bid}", 'parent_bid')
-
-              pipeline.expire("BID-#{bid}-failed", BID_EXPIRE_TTL)
+              pipeline.hget("BID-#{bid}", 'total')
+              pipeline.hget("BID-#{bid}", 'done')
             end
           end
 
@@ -280,7 +287,9 @@ module Sidekiq
           if parent_bid
             Sidekiq.redis do |r|
               r.multi do |pipeline|
-                pipeline.hincrby("BID-#{parent_bid}", 'pending', 1)
+                # НЕ ИНКРЕМЕНТИРУЕМ pending! Это исправляет race condition
+                # Child batch считается "pending" до завершения, после чего Finalize.complete проверит состояние
+                # pipeline.hincrby("BID-#{parent_bid}", 'pending', 1)
                 pipeline.sadd("BID-#{parent_bid}-failed", [jid])
                 pipeline.expire("BID-#{parent_bid}-failed", BID_EXPIRE_TTL)
               end
@@ -288,10 +297,10 @@ module Sidekiq
           end
 
           # Выводим информацию о состоянии батча после неудачного джоба
-          done = pending.to_i - failed.to_i
-          max = pending.to_i + done
+          done_int = done.to_i
+          max = pending.to_i + done_int
           failures_str = failed.to_i > 0 ? "FAILURES: #{failed} ".colorize(:red) : "FAILURES: #{failed} "
-          Sidekiq.logger.info "PENDING: #{pending} ".colorize(:light_yellow) + "DONE: #{done} ".colorize(:green) + "MAX: #{max} ".colorize(:blue) + failures_str
+          Sidekiq.logger.info "PENDING: #{pending} ".colorize(:light_yellow) + "DONE: #{done_int} ".colorize(:green) + "MAX: #{max} ".colorize(:blue) + failures_str
 
           enqueue_callbacks(:complete, bid) if pending.to_i == failed.to_i && children == complete
         end
