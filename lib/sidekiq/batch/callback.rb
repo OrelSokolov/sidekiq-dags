@@ -33,19 +33,8 @@ module Sidekiq
           batch_status = Status.new bid
           send(event, bid, batch_status, batch_status.parent_bid)
 
-
-          # Different events are run in different callback batches
-          # Cleanup callback batch только если это не основной батч
-          Sidekiq::Batch.cleanup_redis callback_bid if callback_batch
-          
-          # Cleanup основного батча только для success event
-          # НО: не удаляем callbacks, если они еще не обработаны
-          # Callbacks могут быть еще в очереди Sidekiq и не выполнены
-          if event == :success
-            # Проверяем, что callbacks обработаны перед cleanup
-            # cleanup_redis сам проверит флаги и не удалит необработанные callbacks
-            Sidekiq::Batch.cleanup_redis bid
-          end
+          # Все ключи автоматически удаляются по TTL (BID_EXPIRE_TTL = 30 дней)
+          # и CALLBACK_FLAG_TTL = 24 часа для флагов обработки callbacks
         end
 
         def success(bid, status, parent_bid)
@@ -105,11 +94,6 @@ module Sidekiq
               Batch.enqueue_callbacks(:complete, parent_bid)
             end
           end
-        end
-
-        def cleanup_redis bid, callback_bid=nil
-          Sidekiq::Batch.cleanup_redis bid
-          Sidekiq::Batch.cleanup_redis callback_bid if callback_bid
         end
       end
     end

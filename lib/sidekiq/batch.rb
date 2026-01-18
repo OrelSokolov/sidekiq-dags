@@ -287,6 +287,12 @@ module Sidekiq
             end
           end
 
+          # Выводим информацию о состоянии батча после неудачного джоба
+          done = pending.to_i - failed.to_i
+          max = pending.to_i + done
+          failures_str = failed.to_i > 0 ? "FAILURES: #{failed} ".colorize(:red) : "FAILURES: #{failed} "
+          Sidekiq.logger.info "PENDING: #{pending} ".colorize(:light_yellow) + "DONE: #{done} ".colorize(:green) + "MAX: #{max} ".colorize(:blue) + failures_str
+
           enqueue_callbacks(:complete, bid) if pending.to_i == failed.to_i && children == complete
         end
       end
@@ -314,7 +320,8 @@ module Sidekiq
           end
 
           max = pending.to_i + done.to_i
-          Sidekiq.logger.info "PENDING: #{pending} ".colorize(:light_yellow) + "DONE: #{done} ".colorize(:green) + "MAX: #{max} ".colorize(:blue)
+          failures_str = failed.to_i > 0 ? "FAILURES: #{failed} ".colorize(:red) : "FAILURES: #{failed} "
+          Sidekiq.logger.info "PENDING: #{pending} ".colorize(:light_yellow) + "DONE: #{done} ".colorize(:green) + "MAX: #{max} ".colorize(:blue) + failures_str
 
           all_success = pending.to_i.zero? && children == success
           # if complete or successfull call complete callback (the complete callback may then call successful)
@@ -456,29 +463,6 @@ module Sidekiq
             cb_batch.run
           end
         end
-      end
-
-      def cleanup_redis(bid)
-        Sidekiq.logger.info { "Cleaning redis of batch #{bid}".colorize(:blue) }
-
-        # Удаляем только основные ключи батча, НЕ удаляем callbacks
-        # Callbacks могут быть еще в очереди Sidekiq и не выполнены
-        # Callbacks удалятся автоматически по TTL (30 дней) или когда будут обработаны
-        keys_to_delete = [
-          "BID-#{bid}",
-          "BID-#{bid}-failed",
-          "BID-#{bid}-success",
-          "BID-#{bid}-complete",
-          "BID-#{bid}-jids"
-        ]
-
-        Sidekiq.redis do |r|
-          r.del(*keys_to_delete)
-        end
-
-        # Callbacks НЕ удаляем - они могут быть еще не выполнены
-        # Они будут удалены по TTL или когда enqueue_callbacks их обработает
-        # Это гарантирует, что callbacks не будут потеряны даже если батч удален
       end
 
       private
