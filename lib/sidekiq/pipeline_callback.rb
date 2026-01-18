@@ -28,6 +28,7 @@ module Sidekiq
     def handle_event(status, options, event_type)
       pipeline_name = options['pipeline_name'] || options[:pipeline_name]
       node_name = options['node_name'] || options[:node_name]
+      Sidekiq.logger.info "HANDLE EVENT: #{event_type} for node: #{node_name}"
       
       return unless pipeline_name && node_name
       
@@ -47,37 +48,48 @@ module Sidekiq
       # Проверяем, что батч действительно завершен
       # Это важно, так как коллбэки могут срабатывать преждевременно из-за race conditions
       # в sidekiq-batch
+
+      Sidekiq.logger.info "Collecting pending data for #{node_name}"
+
+      redis_data = {}
       
       # Получаем pending напрямую из Redis для более надежной проверки
-      batch_pending = begin
-        Sidekiq.redis do |conn|
-          bidkey = "BID-#{status.bid}"
-          pending_str = conn.hget(bidkey, "pending")
-          pending_str ? pending_str.to_i : nil
+      # Используем блокировку Redis для атомарного чтения данных (как в других местах гема)
+      Sidekiq::Batch.with_redis_lock("batch-lock-#{status.bid}", timeout: 5) do
+        redis_data[:batch_pending] = begin
+            Sidekiq.redis do |conn|
+              bidkey = "BID-#{status.bid}"
+              pending_str = conn.hget(bidkey, "pending")
+              pending_str ? pending_str.to_i : nil
+          end
+        rescue => e
+          Sidekiq.logger.warn "⚠️ Could not get pending count for batch #{status.bid}: #{e.message}"
+          nil
         end
-      rescue => e
-        Sidekiq.logger.warn "⚠️ Could not get pending count for batch #{status.bid}: #{e.message}"
-        nil
+        
+        # Также проверяем через status.pending для логирования
+        redis_data[:status_pending] = begin
+          status.pending
+        rescue => e
+          nil
+        end
+        
+        # Получаем количество failures для проверки
+        # status.failures возвращает число (Integer), а не массив!
+        redis_data[:failures_count] = begin
+          status.failures
+        rescue => e
+          Sidekiq.logger.debug "⚠️ Could not get failures from batch status: #{e.message}"
+          0
+        end.to_i
       end
-      
-      # Также проверяем через status.pending для логирования
-      status_pending = begin
-        status.pending
-      rescue => e
-        nil
-      end
-      
-      # Получаем количество failures для проверки
-      # status.failures возвращает число (Integer), а не массив!
-      failures_count = begin
-        status.failures
-      rescue => e
-        Sidekiq.logger.debug "⚠️ Could not get failures from batch status: #{e.message}"
-        0
-      end
-      
-      # Убеждаемся, что failures_count - это число
-      failures_count = failures_count.to_i
+
+      batch_pending = redis_data[:batch_pending]
+      status_pending = redis_data[:status_pending]
+      failures_count = redis_data[:failures_count]
+
+
+      Sidekiq.logger.info "PENDING DATA RECEIVED for #{node_name}"
       
       # Логируем информацию о батче
       Sidekiq.logger.info "🔔 Batch callback #{event_type} for #{pipeline_name}::#{node_name} (bid: #{status.bid}, pending: #{batch_pending}, status.pending: #{status_pending}, failures: #{failures_count})"
@@ -85,7 +97,10 @@ module Sidekiq
       # Если pending не nil и не 0, проверяем, не равен ли он количеству failures
       # Если pending == failures, то это нормальная ситуация (все pending jobs - это failed jobs)
       # Это НЕ race condition!
-      if batch_pending && batch_pending > 0
+
+      Sidekiq.logger.info "Batch pending is #{batch_pending.inspect} and failures count is #{failures_count.inspect}".colorize(:light_yellow)
+
+      if batch_pending.present? && batch_pending > 0
         if batch_pending == failures_count
           # Это нормально: pending == failures, все pending jobs - это failed jobs
           Sidekiq.logger.info "✅ Batch #{status.bid} has #{batch_pending} pending jobs, but all are failures (#{failures_count}) - this is normal, not a race condition"
@@ -95,6 +110,8 @@ module Sidekiq
           Sidekiq.logger.error error_message
           raise RuntimeError, error_message
         end
+      else
+        Sidekiq.logger.info "Strange!".colorize(:red)
       end
       
       # Дополнительная проверка: если pending = nil, это может означать что батч еще не инициализирован
@@ -115,7 +132,11 @@ module Sidekiq
           Sidekiq.logger.warn "⚠️ Batch #{status.bid} pending is nil and node is #{node_record.status}, skipping #{event_type} callback (batch may not be initialized yet)"
           return
         end
+      else
+        Sidekiq.logger.info "Strange too! Pending is #{batch_pending.inspect} and event type is #{event_type}".colorize(:red)
       end
+
+      Sidekiq.logger.info "[Processing event type]".colorize(:yellow)
       
       case event_type
       when 'success'
@@ -175,34 +196,33 @@ module Sidekiq
         # on_complete вызывается всегда, даже если были ошибки
         # Проверяем, не было ли ошибок
         # status.failures возвращает число (Integer), а не массив!
+        Sidekiq.logger.info "[ROCESSING COMPLETE EVENT]".colorize(:green)
         failures_count = begin
           status.failures
         rescue => e
-          Sidekiq.logger.debug "⚠️ Could not get failures from batch status: #{e.message}"
+          Sidekiq.logger.info "⚠️ Could not get failures from batch status: #{e.message}"
           0
         end
         
         failures_count = failures_count.to_i
         
-        if failures_count > 0
-          # Ошибка уже обработана в on_failure
-          Sidekiq.logger.debug "⚠️ Batch complete event ignored - failures present: #{failures_count}"
-          return
-        end
         
         # on_complete - единственное место для завершения ноды и запуска следующей
         # Перезагружаем ноду из БД, чтобы убедиться, что у нас актуальное состояние
         node_record.reload
+
+        Sidekiq.logger.info "Node record loaded".colorize(:light_yellow)
+        Sidekiq.logger.info "Node: #{node_record.inspect}".colorize(:light_yellow)
         
         # Проверяем, что нода действительно в статусе running или pending перед завершением
         # Если нода в pending, значит mark_node_started! не был вызван, но батч завершился - помечаем как running и затем completed
         if node_record.pending?
           node_record.start!
-          Sidekiq.logger.debug "⚠️ Node #{pipeline_name}::#{node_name} was pending, marking as running"
+          Sidekiq.logger.info "⚠️ Node #{pipeline_name}::#{node_name} was pending, marking as running"
         end
         
         unless node_record.running?
-          Sidekiq.logger.debug "⚠️ Batch complete event ignored - node #{pipeline_name}::#{node_name} is not in running status (current: #{node_record.status})"
+          Sidekiq.logger.info "⚠️ Batch complete event ignored - node #{pipeline_name}::#{node_name} is not in running status (current: #{node_record.status})"
           return
         end
         
@@ -218,7 +238,7 @@ module Sidekiq
             trigger_next_node(pipeline_name, node_name)
           end
         else
-          Sidekiq.logger.debug "⚠️ Batch complete event ignored - node already #{node_record.status}"
+          Sidekiq.logger.info "⚠️ Batch complete event ignored - node already #{node_record.status}"
         end
       end
     rescue RuntimeError => e

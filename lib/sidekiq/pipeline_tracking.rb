@@ -76,6 +76,7 @@ module Sidekiq
 
     # Вызывается при успешном завершении ноды
     def mark_node_completed!
+      puts "CURRENT NODE RECORD: #{current_node_record.inspect}"
       return unless current_node_record
       ensure_node_record_exists!
       current_node_record.complete!

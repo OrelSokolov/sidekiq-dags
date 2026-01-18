@@ -474,13 +474,12 @@ module Sidekiq
         end
       end
 
-      private
-
       def with_redis_lock(lock_key, timeout: 30, max_wait: 60)
         # Генерируем уникальный токен для этого lock'а
         lock_token = SecureRandom.uuid
         locked = false
         start_time = Time.now
+        result = nil
 
         begin
           # Пытаемся получить lock с повторными попытками
@@ -502,7 +501,7 @@ module Sidekiq
           end
 
           # Выполняем блок кода под lock'ом
-          yield
+          result = yield
         ensure
           # Освобождаем lock только если мы его держим (проверяем токен)
           if locked
@@ -512,8 +511,11 @@ module Sidekiq
               r.del(lock_key) if current_token == lock_token
             end
           end
+          result 
         end
       end
+
+      private
 
       def push_callbacks(args, queue)
         return if args.empty?
