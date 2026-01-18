@@ -414,6 +414,10 @@ describe Sidekiq::PipelineCallback do
   # =============================================================================
   # ТЕСТЫ: Race condition detection с учетом failures
   # Проверяем, что когда pending == failures, это НЕ race condition
+  # 
+  # ВАЖНО: Используем реальный объект Sidekiq::Batch::Status вместо моков,
+  # потому что status.failures возвращает число (Integer), а не массив!
+  # Мокирование failures как массива скрывало реальную проблему в коде.
   # =============================================================================
   describe 'race condition detection with failures' do
     before(:each) do
@@ -437,29 +441,30 @@ describe Sidekiq::PipelineCallback do
     end
     
     it 'does NOT raise error when pending == failures (normal situation)' do
-      # Создаем mock batch status с pending == failures
+      # Создаем реальный batch status с pending == failures
       batch_id = 'TEST_BATCH_123'
       
       # Создаем батч в Redis с pending = 5 и failures = 5
+      # status.failures возвращает число (scard), поэтому создаем set с 5 элементами
       Sidekiq.redis do |conn|
         bidkey = "BID-#{batch_id}"
         conn.hset(bidkey, "pending", 5)
         conn.hset(bidkey, "total", 10)
-        conn.hset(bidkey, "failures", 5)
         conn.expire(bidkey, 3600)
+        
+        # Создаем set с 5 failed jobs (status.failures = scard этого set)
+        5.times do |i|
+          conn.sadd("BID-#{batch_id}-failed", "failed_job_#{i}")
+        end
+        conn.expire("BID-#{batch_id}-failed", 3600)
       end
       
-      # Создаем mock status объект
-      status = double('BatchStatus')
-      allow(status).to receive(:bid).and_return(batch_id)
-      allow(status).to receive(:pending).and_return(5)
-      allow(status).to receive(:failures).and_return([
-        { 'errmsg' => 'Error 1' },
-        { 'errmsg' => 'Error 2' },
-        { 'errmsg' => 'Error 3' },
-        { 'errmsg' => 'Error 4' },
-        { 'errmsg' => 'Error 5' }
-      ])
+      # Используем реальный объект Status вместо мока
+      status = Sidekiq::Batch::Status.new(batch_id)
+      
+      # Проверяем, что настройка правильная
+      expect(status.pending).to eq(5)
+      expect(status.failures).to eq(5)  # status.failures возвращает число!
       
       options = {
         'pipeline_name' => 'alpha',
@@ -476,26 +481,30 @@ describe Sidekiq::PipelineCallback do
     end
     
     it 'DOES raise error when pending > failures (real race condition)' do
-      # Создаем mock batch status с pending > failures
+      # Создаем реальный batch status с pending > failures
       batch_id = 'TEST_BATCH_456'
       
       # Создаем батч в Redis с pending = 5 и failures = 2
+      # status.failures возвращает число (scard), поэтому создаем set с 2 элементами
       Sidekiq.redis do |conn|
         bidkey = "BID-#{batch_id}"
         conn.hset(bidkey, "pending", 5)
         conn.hset(bidkey, "total", 10)
-        conn.hset(bidkey, "failures", 2)
         conn.expire(bidkey, 3600)
+        
+        # Создаем set с 2 failed jobs (status.failures = scard этого set)
+        2.times do |i|
+          conn.sadd("BID-#{batch_id}-failed", "failed_job_#{i}")
+        end
+        conn.expire("BID-#{batch_id}-failed", 3600)
       end
       
-      # Создаем mock status объект
-      status = double('BatchStatus')
-      allow(status).to receive(:bid).and_return(batch_id)
-      allow(status).to receive(:pending).and_return(5)
-      allow(status).to receive(:failures).and_return([
-        { 'errmsg' => 'Error 1' },
-        { 'errmsg' => 'Error 2' }
-      ])
+      # Используем реальный объект Status вместо мока
+      status = Sidekiq::Batch::Status.new(batch_id)
+      
+      # Проверяем, что настройка правильная
+      expect(status.pending).to eq(5)
+      expect(status.failures).to eq(2)  # status.failures возвращает число!
       
       options = {
         'pipeline_name' => 'alpha',
@@ -509,23 +518,25 @@ describe Sidekiq::PipelineCallback do
     end
     
     it 'does NOT raise error when pending == 0 (normal completion)' do
-      # Создаем mock batch status с pending = 0
+      # Создаем реальный batch status с pending = 0
       batch_id = 'TEST_BATCH_789'
       
-      # Создаем батч в Redis с pending = 0
+      # Создаем батч в Redis с pending = 0 и failures = 0
       Sidekiq.redis do |conn|
         bidkey = "BID-#{batch_id}"
         conn.hset(bidkey, "pending", 0)
         conn.hset(bidkey, "total", 10)
-        conn.hset(bidkey, "failures", 0)
         conn.expire(bidkey, 3600)
+        
+        # Не создаем failed set, поэтому status.failures вернет 0
       end
       
-      # Создаем mock status объект
-      status = double('BatchStatus')
-      allow(status).to receive(:bid).and_return(batch_id)
-      allow(status).to receive(:pending).and_return(0)
-      allow(status).to receive(:failures).and_return([])
+      # Используем реальный объект Status вместо мока
+      status = Sidekiq::Batch::Status.new(batch_id)
+      
+      # Проверяем, что настройка правильная
+      expect(status.pending).to eq(0)
+      expect(status.failures).to eq(0)  # status.failures возвращает число!
       
       options = {
         'pipeline_name' => 'alpha',
@@ -538,8 +549,9 @@ describe Sidekiq::PipelineCallback do
       }.not_to raise_error
     end
     
-    it 'handles nil failures gracefully' do
-      # Создаем mock batch status с pending = 3 и nil failures
+    it 'handles failures exception gracefully' do
+      # Создаем реальный batch status с pending = 3 и failures = 0
+      # но мокируем failures чтобы выбросить исключение
       batch_id = 'TEST_BATCH_NIL_FAILURES'
       
       # Создаем батч в Redis с pending = 3
@@ -550,19 +562,20 @@ describe Sidekiq::PipelineCallback do
         conn.expire(bidkey, 3600)
       end
       
-      # Создаем mock status объект с nil failures
-      status = double('BatchStatus')
-      allow(status).to receive(:bid).and_return(batch_id)
-      allow(status).to receive(:pending).and_return(3)
+      # Используем реальный объект Status, но мокируем failures чтобы выбросить исключение
+      status = Sidekiq::Batch::Status.new(batch_id)
       allow(status).to receive(:failures).and_raise(StandardError.new('No failures'))
+      
+      # Проверяем, что pending правильный
+      expect(status.pending).to eq(3)
       
       options = {
         'pipeline_name' => 'alpha',
         'node_name' => 'RootNode'
       }
       
-      # Вызываем on_complete - должно обработать nil failures как пустой массив
-      # и поднять ошибку, так как pending = 3 > 0 и failures = 0
+      # Вызываем on_complete - должно обработать исключение failures как 0
+      # и поднять ошибку, так как pending = 3 > 0 и failures = 0 (после обработки исключения)
       expect {
         callback.on_complete(status, options)
       }.to raise_error(RuntimeError, /race condition detected/)

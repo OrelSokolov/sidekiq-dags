@@ -68,16 +68,16 @@ module Sidekiq
       end
       
       # Получаем количество failures для проверки
-      batch_failures = begin
+      # status.failures возвращает число (Integer), а не массив!
+      failures_count = begin
         status.failures
       rescue => e
         Sidekiq.logger.debug "⚠️ Could not get failures from batch status: #{e.message}"
-        []
+        0
       end
       
-      # Проверяем, что failures - это массив
-      batch_failures = [] unless batch_failures.is_a?(Array)
-      failures_count = batch_failures.size
+      # Убеждаемся, что failures_count - это число
+      failures_count = failures_count.to_i
       
       # Логируем информацию о батче
       Sidekiq.logger.info "🔔 Batch callback #{event_type} for #{pipeline_name}::#{node_name} (bid: #{status.bid}, pending: #{batch_pending}, status.pending: #{status_pending}, failures: #{failures_count})"
@@ -129,29 +129,33 @@ module Sidekiq
         # Сначала проверяем, передано ли сообщение об ошибке напрямую через опции (для тестов)
         error_msg = options['error_message'] || options[:error_message]
         
-        # Если сообщение не передано напрямую, пытаемся получить из status.failures
+        # Если сообщение не передано напрямую, пытаемся получить из status.failure_info
+        # status.failures возвращает число, а status.failure_info возвращает массив JID'ов
         unless error_msg
-          failures = begin
-            status.failures
+          failure_info = begin
+            status.failure_info
           rescue => e
-            Sidekiq.logger.debug "⚠️ Could not get failures from batch status: #{e.message}"
+            Sidekiq.logger.debug "⚠️ Could not get failure_info from batch status: #{e.message}"
             []
           end
           
-          # Проверяем, что failures - это массив
-          failures = [] unless failures.is_a?(Array)
+          # Проверяем, что failure_info - это массив
+          failure_info = [] unless failure_info.is_a?(Array)
           
-          if failures.any?
-            # Получаем первую ошибку
-            first_failure = failures.first
+          if failure_info.any?
+            # Получаем первый JID failed job
+            first_failure_jid = failure_info.first
             
-            # Ошибка может быть строкой (JSON) или хешем
-            error_msg = if first_failure.is_a?(String)
-              # Парсим JSON строку
-              parsed = JSON.parse(first_failure) rescue {}
-              parsed['errmsg'] || parsed[:errmsg] || 'Batch failed'
-            elsif first_failure.is_a?(Hash)
-              first_failure['errmsg'] || first_failure[:errmsg] || 'Batch failed'
+            # JID может быть строкой (JSON) или просто строкой
+            # Пытаемся извлечь сообщение об ошибке, если оно есть в JID
+            error_msg = if first_failure_jid.is_a?(String)
+              # Пытаемся распарсить как JSON, если не получится - используем как есть
+              parsed = JSON.parse(first_failure_jid) rescue nil
+              if parsed && (parsed['errmsg'] || parsed[:errmsg])
+                parsed['errmsg'] || parsed[:errmsg]
+              else
+                "Batch failed (failed job: #{first_failure_jid})"
+              end
             else
               'Batch failed'
             end
@@ -170,19 +174,19 @@ module Sidekiq
       when 'complete'
         # on_complete вызывается всегда, даже если были ошибки
         # Проверяем, не было ли ошибок
-        failures = begin
+        # status.failures возвращает число (Integer), а не массив!
+        failures_count = begin
           status.failures
         rescue => e
           Sidekiq.logger.debug "⚠️ Could not get failures from batch status: #{e.message}"
-          []
+          0
         end
         
-        # Проверяем, что failures - это массив и он не пустой
-        failures = [] unless failures.is_a?(Array)
+        failures_count = failures_count.to_i
         
-        if failures.any?
+        if failures_count > 0
           # Ошибка уже обработана в on_failure
-          Sidekiq.logger.debug "⚠️ Batch complete event ignored - failures present: #{failures.size}"
+          Sidekiq.logger.debug "⚠️ Batch complete event ignored - failures present: #{failures_count}"
           return
         end
         
