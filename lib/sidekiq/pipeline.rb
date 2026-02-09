@@ -1,7 +1,5 @@
 # frozen_string_literal: true
 
-require 'set'
-
 module Sidekiq
   # Модель для хранения состояния пайплайнов
   # Каждый пайплайн имеет ровно одну запись (singleton)
@@ -11,7 +9,8 @@ module Sidekiq
   class SidekiqPipeline < ::ActiveRecord::Base
     self.table_name = 'sidekiq_pipelines'
 
-    has_many :sidekiq_pipeline_nodes, class_name: 'Sidekiq::SidekiqPipelineNode', dependent: :destroy, foreign_key: 'sidekiq_pipeline_id'
+    has_many :sidekiq_pipeline_nodes, class_name: 'Sidekiq::SidekiqPipelineNode', dependent: :destroy,
+                                      foreign_key: 'sidekiq_pipeline_id'
 
     validates :pipeline_name, presence: true, uniqueness: true
 
@@ -26,9 +25,20 @@ module Sidekiq
     # Получить singleton для пайплайна
     def self.for(name)
       return nil unless table_exists?
-      find_or_create_by!(pipeline_name: name.to_s.downcase)
+
+      pipeline_name = underscore(name.to_s)
+      puts "Create pipeline for #{name}: #{pipeline_name}".colorize(:red)
+      find_or_create_by!(pipeline_name: pipeline_name)
     rescue ::ActiveRecord::StatementInvalid, ::ActiveRecord::NoDatabaseError
       nil
+    end
+
+    def self.underscore(string)
+      string.to_s.gsub(/::/, '/')
+            .gsub(/([A-Z]+)([A-Z][a-z])/, '\1_\2')
+            .gsub(/([a-z\d])([A-Z])/, '\1_\2')
+            .tr('-', '_')
+            .downcase
     end
 
     # Запустить пайплайн
@@ -52,7 +62,7 @@ module Sidekiq
 
     # Переопределяем методы статусов - определяем их динамически на основе нод
     # Это предотвращает зависание пайплайна в статусе running
-    
+
     # Проверить запущен ли пайплайн
     # Пайплайн считается running если:
     # 1. Есть хотя бы одна running нода ИЛИ
@@ -60,14 +70,16 @@ module Sidekiq
     def running?
       return true if sidekiq_pipeline_nodes.where(status: :running).exists?
       return true if has_jobs_in_queue?
+
       false
     end
 
     # Проверить завершен ли пайплайн (все ноды completed или skipped, и нет running/failed)
     def completed?
       return false if sidekiq_pipeline_nodes.empty?
-      return false if sidekiq_pipeline_nodes.where(status: [:running, :pending, :failed]).exists?
-      sidekiq_pipeline_nodes.where(status: [:completed, :skipped]).exists?
+      return false if sidekiq_pipeline_nodes.where(status: %i[running pending failed]).exists?
+
+      sidekiq_pipeline_nodes.where(status: %i[completed skipped]).exists?
     end
 
     # Проверить есть ли ошибки (хотя бы одна failed нода)
@@ -92,6 +104,7 @@ module Sidekiq
       return 'failed' if failed?
       return 'running' if running?
       return 'completed' if completed?
+
       'idle'
     end
 
@@ -109,7 +122,7 @@ module Sidekiq
     def progress_percent
       total = sidekiq_pipeline_nodes.count
       return 0 if total.zero?
-      
+
       completed_count = sidekiq_pipeline_nodes.completed.count
       ((completed_count.to_f / total) * 100).round(1)
     end
@@ -130,9 +143,7 @@ module Sidekiq
       return false if queue_name.blank?
 
       # В тестовом окружении проверяем переменную класса для симуляции
-      if defined?(Rails) && Rails.env.test? && self.class.test_queues_with_jobs&.include?(queue_name)
-        return true
-      end
+      return true if defined?(Rails) && Rails.env.test? && self.class.test_queues_with_jobs&.include?(queue_name)
 
       begin
         # Проверяем pending задачи в очереди
@@ -146,7 +157,7 @@ module Sidekiq
         end
 
         false
-      rescue => e
+      rescue StandardError => e
         # Если очередь не существует или произошла ошибка, считаем что задач нет
         Sidekiq.logger.debug "Queue #{queue_name} check failed: #{e.message}"
         false
@@ -154,4 +165,3 @@ module Sidekiq
     end
   end
 end
-

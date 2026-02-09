@@ -16,10 +16,18 @@ module Sidekiq
       class_name = self.class.name
       if class_name.include?('::')
         namespace = class_name.split('::')[0..-2].join('::')
-        namespace.downcase
+        underscore(namespace)
       else
-        class_name.downcase
+        underscore(class_name)
       end
+    end
+
+    def underscore(string)
+      string.to_s.gsub(/::/, '/')
+            .gsub(/([A-Z]+)([A-Z][a-z])/, '\1_\2')
+            .gsub(/([a-z\d])([A-Z])/, '\1_\2')
+            .tr('-', '_')
+            .downcase
     end
 
     # Получить имя ноды из класса
@@ -35,12 +43,14 @@ module Sidekiq
     # Получить объект текущего пайплайна
     def current_pipeline
       return nil unless defined?(SidekiqPipeline) && SidekiqPipeline.table_exists?
+
       @current_pipeline ||= SidekiqPipeline.for(pipeline_name)
     end
 
     # Получить объект текущей ноды
     def current_node_record
       return nil unless defined?(SidekiqPipelineNode) && SidekiqPipelineNode.table_exists?
+
       @current_node_record ||= SidekiqPipelineNode.for(pipeline_name, node_name)
     end
 
@@ -53,7 +63,7 @@ module Sidekiq
     # Вызывается в начале выполнения ноды
     def mark_node_started!
       return false unless current_pipeline && current_node_record
-      
+
       # Гарантируем создание SidekiqPipelineNode перед любыми операциями
       # Это важно, так как запись может использоваться в mark_node_completed! или mark_node_failed!
       ensure_node_record_exists!
@@ -78,13 +88,12 @@ module Sidekiq
     def mark_node_completed!
       puts "CURRENT NODE RECORD: #{current_node_record.inspect}"
       return unless current_node_record
+
       ensure_node_record_exists!
       current_node_record.complete!
 
       # Если это EndNode - завершаем пайплайн
-      if node_name == 'EndNode' && current_pipeline
-        current_pipeline.finish!(success: true)
-      end
+      current_pipeline.finish!(success: true) if node_name == 'EndNode' && current_pipeline
     rescue ::ActiveRecord::StatementInvalid, ::ActiveRecord::NoDatabaseError => e
       Sidekiq.logger.debug "Pipeline tracking disabled: #{e.message}"
     end
@@ -92,6 +101,7 @@ module Sidekiq
     # Вызывается при ошибке в ноде
     def mark_node_failed!(error)
       return unless current_node_record && current_pipeline
+
       ensure_node_record_exists!
       current_node_record.fail!(error.message)
       current_pipeline.finish!(success: false, error: error.message)
@@ -102,14 +112,11 @@ module Sidekiq
     # Получить активные ноды для UI (совместимость со старым кодом)
     # Возвращает массив строк в формате "Skillcorner_RootNode"
     def self.get_active_nodes_for_ui(pipeline_name = nil)
-      scope = SidekiqPipelineNode.joins(:sidekiq_pipeline).where(status: [:running, :completed])
-      
-      if pipeline_name
-        scope = scope.where(sidekiq_pipelines: { pipeline_name: pipeline_name.to_s.downcase })
-      end
+      scope = SidekiqPipelineNode.joins(:sidekiq_pipeline).where(status: %i[running completed])
+
+      scope = scope.where(sidekiq_pipelines: { pipeline_name: pipeline_name.to_s.downcase }) if pipeline_name
 
       scope.map(&:node_id)
     end
   end
 end
-
