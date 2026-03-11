@@ -73,7 +73,7 @@ module Sidekiq
     def custom_notifiers(prefix, msg); end
 
     def perform(*args, **kwargs)
-      single_mode = kwargs.delete(:single) || false
+      single_mode = kwargs.delete(:single) || kwargs.delete('single') || false
       observer
 
       # Отслеживание начала ноды (если включен PipelineTracking)
