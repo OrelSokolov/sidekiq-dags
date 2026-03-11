@@ -581,5 +581,164 @@ describe Sidekiq::PipelineCallback do
       }.to raise_error(RuntimeError, /race condition detected/)
     end
   end
+
+  # =============================================================================
+  # ТЕСТЫ: Single режим
+  # Проверяем, что когда передан 'single' => true:
+  # - callback не запускает следующую ноду
+  # - нода помечается как completed
+  # =============================================================================
+  describe 'single mode' do
+    before(:each) do
+      # Проверяем доступность БД
+      unless defined?(ActiveRecord) && ActiveRecord::Base.connected? &&
+             Sidekiq::SidekiqPipeline.table_exists?
+        skip "Pipeline tracking requires ActiveRecord and database setup"
+      end
+
+      # Создаем тестовый пайплайн и ноду
+      @pipeline = Sidekiq::SidekiqPipeline.for('alpha')
+      @node = Sidekiq::SidekiqPipelineNode.for('alpha', 'RootNode')
+      @node.start! # Устанавливаем статус running
+
+      Sidekiq::Testing.fake!
+      Sidekiq::Worker.clear_all
+    end
+
+    after(:each) do
+      Sidekiq::Worker.clear_all
+      if defined?(ActiveRecord) && ActiveRecord::Base.connected?
+        Sidekiq::SidekiqPipelineNode.destroy_all
+        Sidekiq::SidekiqPipeline.destroy_all
+      end
+    end
+
+    it 'does NOT trigger next_node when single mode is enabled' do
+      # Создаем batch status с pending = 0 (успешное завершение)
+      batch_id = 'TEST_SINGLE_MODE'
+
+      Sidekiq.redis do |conn|
+        bidkey = "BID-#{batch_id}"
+        conn.hset(bidkey, "pending", 0)
+        conn.hset(bidkey, "total", 1)
+        conn.expire(bidkey, 3600)
+      end
+
+      status = Sidekiq::Batch::Status.new(batch_id)
+
+      # Проверяем что следующая нода еще не запланирована
+      expect(Alpha::TeamsNode.jobs.size).to eq(0)
+
+      options = {
+        'pipeline_name' => 'alpha',
+        'node_name' => 'RootNode',
+        'single' => true
+      }
+
+      # Вызываем on_complete с single => true
+      callback.on_complete(status, options)
+
+      # Проверяем что нода помечена как completed
+      @node.reload
+      expect(@node).to be_completed
+
+      # КРИТИЧЕСКАЯ ПРОВЕРКА: следующая нода НЕ должна быть запланирована
+      expect(Alpha::TeamsNode.jobs.size).to eq(0),
+        "TeamsNode не должен быть запланирован в single режиме"
+    end
+
+    it 'triggers next_node when single mode is NOT enabled' do
+      # Создаем batch status с pending = 0 (успешное завершение)
+      batch_id = 'TEST_NON_SINGLE_MODE'
+
+      Sidekiq.redis do |conn|
+        bidkey = "BID-#{batch_id}"
+        conn.hset(bidkey, "pending", 0)
+        conn.hset(bidkey, "total", 1)
+        conn.expire(bidkey, 3600)
+      end
+
+      status = Sidekiq::Batch::Status.new(batch_id)
+
+      options = {
+        'pipeline_name' => 'alpha',
+        'node_name' => 'RootNode',
+        'single' => false
+      }
+
+      # Вызываем on_complete с single => false
+      callback.on_complete(status, options)
+
+      # Проверяем что нода помечена как completed
+      @node.reload
+      expect(@node).to be_completed
+
+      # Проверяем что следующая нода ЗАПЛАНИРОВАНА
+      expect(Alpha::TeamsNode.jobs.size).to eq(1),
+        "TeamsNode должен быть запланирован когда single режим отключен"
+    end
+
+    it 'does NOT trigger next_node when single option is missing (default behavior)' do
+      # Создаем batch status с pending = 0 (успешное завершение)
+      batch_id = 'TEST_NO_SINGLE_OPTION'
+
+      Sidekiq.redis do |conn|
+        bidkey = "BID-#{batch_id}"
+        conn.hset(bidkey, "pending", 0)
+        conn.hset(bidkey, "total", 1)
+        conn.expire(bidkey, 3600)
+      end
+
+      status = Sidekiq::Batch::Status.new(batch_id)
+
+      options = {
+        'pipeline_name' => 'alpha',
+        'node_name' => 'RootNode'
+        # 'single' опция отсутствует - должно работать как обычно
+      }
+
+      # Вызываем on_complete без single опции
+      callback.on_complete(status, options)
+
+      # Проверяем что нода помечена как completed
+      @node.reload
+      expect(@node).to be_completed
+
+      # Проверяем что следующая нода ЗАПЛАНИРОВАНА (по умолчанию single = false)
+      expect(Alpha::TeamsNode.jobs.size).to eq(1),
+        "TeamsNode должен быть запланирован по умолчанию (без single опции)"
+    end
+
+    it 'handles single mode with symbol key :single' do
+      # Создаем batch status с pending = 0 (успешное завершение)
+      batch_id = 'TEST_SINGLE_SYMBOL'
+
+      Sidekiq.redis do |conn|
+        bidkey = "BID-#{batch_id}"
+        conn.hset(bidkey, "pending", 0)
+        conn.hset(bidkey, "total", 1)
+        conn.expire(bidkey, 3600)
+      end
+
+      status = Sidekiq::Batch::Status.new(batch_id)
+
+      options = {
+        'pipeline_name' => 'alpha',
+        'node_name' => 'RootNode',
+        :single => true  # символ вместо строки
+      }
+
+      # Вызываем on_complete с :single => true
+      callback.on_complete(status, options)
+
+      # Проверяем что нода помечена как completed
+      @node.reload
+      expect(@node).to be_completed
+
+      # КРИТИЧЕСКАЯ ПРОВЕРКА: следующая нода НЕ должна быть запланирована
+      expect(Alpha::TeamsNode.jobs.size).to eq(0),
+        "TeamsNode не должен быть запланирован в single режиме (с символом :single)"
+    end
+  end
 end
 

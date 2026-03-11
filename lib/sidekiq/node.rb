@@ -6,6 +6,10 @@ module Sidekiq
     include Sidekiq::Worker
     include Sidekiq::Batch::Callback
 
+    def self.supports_single_mode
+      true
+    end
+
     def self.execute(&block)
       define_method(:execute) do |*args, **kwargs|
         # Проверяем arity блока чтобы решить как вызывать
