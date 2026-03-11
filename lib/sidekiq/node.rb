@@ -77,7 +77,10 @@ module Sidekiq
     def custom_notifiers(prefix, msg); end
 
     def perform(*args, **kwargs)
-      single_mode = kwargs.delete(:single) || kwargs.delete('single') || false
+      # Sidekiq serializes kwargs to JSON, so single may be in args (last element if it's a Hash)
+      options = args.last.is_a?(Hash) ? args.pop : {}
+      single_mode = kwargs.delete(:single) || kwargs.delete('single') ||
+                    options['single'] || options[:single] || false
       observer
 
       # Отслеживание начала ноды (если включен PipelineTracking)
