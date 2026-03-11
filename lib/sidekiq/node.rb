@@ -6,7 +6,7 @@ module Sidekiq
     include Sidekiq::Worker
     include Sidekiq::Batch::Callback
 
-    def self.execute &block
+    def self.execute(&block)
       define_method(:execute) do |*args, **kwargs|
         # Проверяем arity блока чтобы решить как вызывать
         # arity = 0 означает блок не принимает аргументы
@@ -21,24 +21,24 @@ module Sidekiq
       end
     end
 
-    def self.desc str
+    def self.desc(str)
       define_method(:desc) do
         str
       end
     end
 
-    def self.next_node arg
+    def self.next_node(arg)
       define_method(:next_node) do
         klass = arg
-        if klass.kind_of?(Symbol)
+        if klass.is_a?(Symbol)
           class_name = self.class.name
           # Извлекаем namespace из имени класса
           namespace = if class_name.include?('::')
-            class_name.split('::')[0..-2].join('::')
-          else
-            ''
-          end
-          full_name = namespace.empty? ? klass.to_s : "#{namespace}::#{klass.to_s}"
+                        class_name.split('::')[0..-2].join('::')
+                      else
+                        ''
+                      end
+          full_name = namespace.empty? ? klass.to_s : "#{namespace}::#{klass}"
           # Используем constantize из ActiveSupport или простой поиск константы
           if defined?(ActiveSupport::Inflector)
             full_name.constantize
@@ -52,33 +52,28 @@ module Sidekiq
       end
     end
 
-    def self.observer &block
+    def self.observer(&block)
       define_method(:observer) do
         instance_exec(&block)
       end
     end
 
     def desc
-      "Sidekiq::Node"
+      'Sidekiq::Node'
     end
 
-    def execute(*args, **kwargs)
-
-    end
+    def execute(*args, **kwargs); end
 
     def next_node
       nil
     end
 
-    def observer
+    def observer; end
 
-    end
-
-    def custom_notifiers(prefix, msg)
-
-    end
+    def custom_notifiers(prefix, msg); end
 
     def perform(*args, **kwargs)
+      single_mode = kwargs.delete(:single) || false
       observer
 
       # Отслеживание начала ноды (если включен PipelineTracking)
@@ -107,18 +102,20 @@ module Sidekiq
         pipeline_name = self.pipeline_name
         node_name = self.node_name
         @batch.on(:complete, Sidekiq::PipelineCallback, {
-          'pipeline_name' => pipeline_name,
-          'node_name' => node_name
-        })
+                    'pipeline_name' => pipeline_name,
+                    'node_name' => node_name,
+                    'single' => single_mode
+                  })
         @batch.on(:failure, Sidekiq::PipelineCallback, {
-          'pipeline_name' => pipeline_name,
-          'node_name' => node_name
-        })
+                    'pipeline_name' => pipeline_name,
+                    'node_name' => node_name,
+                    'single' => single_mode
+                  })
         # Не регистрируем стандартный callback, если используется PipelineTracking
         # PipelineCallback сам запустит следующую ноду
       else
         # Если PipelineTracking не используется, используем стандартный callback
-        @batch.on(:complete, self.class)
+        @batch.on(:complete, self.class, 'single' => single_mode)
       end
       @batch.run
 
@@ -133,13 +130,17 @@ module Sidekiq
     end
 
     def on_complete(status, options)
-      # Sidekiq.logger.info "#{Time.current.to_f} 🔥 ON COMPLETE EXISTS? #{status.exists?}".colorize(:red)
-      # Sidekiq.logger.info status.data.to_s.colorize(:yellow)
+      single_mode = options['single'] || options[:single]
 
       desc_str = desc
       desc_str = nil if desc_str.respond_to?(:present?) && !desc_str.present?
       desc_str = desc if desc_str.nil? || (desc_str.respond_to?(:empty?) && desc_str.empty?)
       notify_all "✔️ #{desc_str || self.class} (#{status.total})   |  #{status.bid}"
+
+      if single_mode
+        notify_all '🔶 Single mode - skipping next_node'
+        return
+      end
 
       next_node_class = next_node
       if next_node_class && (next_node_class.respond_to?(:present?) ? next_node_class.present? : !next_node_class.nil?)
@@ -173,7 +174,7 @@ module Sidekiq
           node_record.update_column(:bid, bid)
           Sidekiq.logger.debug "💾 Saved BID #{bid} to database for #{pipeline_name}::#{node_name}"
         end
-      rescue => e
+      rescue StandardError => e
         Sidekiq.logger.warn "⚠️ Failed to save BID #{bid} to database: #{e.message}"
       end
     end
