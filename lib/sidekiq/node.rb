@@ -165,24 +165,17 @@ module Sidekiq
 
     private
 
-    # Сохраняет BID текущего батча в базу данных для ноды
+    # Сохраняет BID текущего батча в Redis для ноды
     def save_bid_to_database!(bid)
-      return unless defined?(SidekiqPipelineNode) && SidekiqPipelineNode.table_exists?
-
+      return unless bid
+      
       begin
         if respond_to?(:pipeline_name) && respond_to?(:node_name)
-          pipeline_name = self.pipeline_name
-          node_name = self.node_name
-
-          node_record = SidekiqPipelineNode.for(pipeline_name, node_name)
-          return unless node_record
-
-          # Обновляем BID для ноды
-          node_record.update_column(:bid, bid)
-          Sidekiq.logger.debug "💾 Saved BID #{bid} to database for #{pipeline_name}::#{node_name}"
+          PipelineStatus.save_bid!(pipeline_name, node_name, bid)
+          Sidekiq.logger.debug "💾 Saved BID #{bid} to Redis for #{pipeline_name}::#{node_name}"
         end
       rescue StandardError => e
-        Sidekiq.logger.warn "⚠️ Failed to save BID #{bid} to database: #{e.message}"
+        Sidekiq.logger.warn "⚠️ Failed to save BID #{bid} to Redis: #{e.message}"
       end
     end
 

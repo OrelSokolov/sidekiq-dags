@@ -1,156 +1,145 @@
 # frozen_string_literal: true
 
 module Sidekiq
-  # Модель для хранения состояния пайплайнов
-  # Каждый пайплайн имеет ровно одну запись (singleton)
-  #
-  # ВАЖНО: Статус пайплайна определяется динамически на основе статусов нод,
-  # а не из поля status в БД. Это предотвращает зависание пайплайна в статусе running.
-  class SidekiqPipeline < ::ActiveRecord::Base
-    self.table_name = 'sidekiq_pipelines'
+  # Класс для управления состоянием пайплайнов в Redis
+  class SidekiqPipeline
+    attr_reader :pipeline_name
 
-    has_many :sidekiq_pipeline_nodes, class_name: 'Sidekiq::SidekiqPipelineNode', dependent: :destroy,
-                                      foreign_key: 'sidekiq_pipeline_id'
-
-    validates :pipeline_name, presence: true, uniqueness: true
-
-    # Переменная класса для тестов - хранит очереди, которые должны считаться занятыми
-    # Используется в тестах для симуляции наличия задач в очереди
     @test_queues_with_jobs = Set.new
 
     class << self
       attr_accessor :test_queues_with_jobs
-    end
 
-    # Получить singleton для пайплайна
-    def self.for(name)
-      return nil unless table_exists?
-
-      pipeline_name = underscore(name.to_s)
-      puts "Create pipeline for #{name}: #{pipeline_name}".colorize(:red)
-      find_or_create_by!(pipeline_name: pipeline_name)
-    rescue ::ActiveRecord::StatementInvalid, ::ActiveRecord::NoDatabaseError
-      nil
-    end
-
-    def self.underscore(string)
-      string.to_s.gsub(/::/, '/')
-            .gsub(/([A-Z]+)([A-Z][a-z])/, '\1_\2')
-            .gsub(/([a-z\d])([A-Z])/, '\1_\2')
-            .tr('-', '_')
-            .downcase
-    end
-
-    # Запустить пайплайн
-    def start!
-      transaction do
-        # Обновляем только run_at, статус определяется динамически на основе нод
-        update!(run_at: Time.current)
-        # Сбрасываем статусы всех нод
-        sidekiq_pipeline_nodes.update_all(status: 0, run_at: nil, error_message: nil)
+      def for(name)
+        pipeline_name = underscore(name.to_s)
+        puts "Create pipeline for #{name}: #{pipeline_name}".colorize(:red) if defined?(Colorize)
+        
+        new(pipeline_name)
+      rescue => e
+        Sidekiq.logger.error "Error creating pipeline #{name}: #{e.message}" if Sidekiq.logger
+        nil
       end
-      Sidekiq.logger.info "🚀 Pipeline #{pipeline_name} started"
+
+      def underscore(string)
+        string.to_s.gsub(/::/, '/')
+              .gsub(/([A-Z]+)([A-Z][a-z])/, '\1_\2')
+              .gsub(/([a-z\d])([A-Z])/, '\1_\2')
+              .tr('-', '_')
+              .downcase
+      end
     end
 
-    # Завершить пайплайн (больше не обновляем статус в БД)
-    # Статус определяется автоматически на основе нод
+    def initialize(pipeline_name)
+      @pipeline_name = pipeline_name
+    end
+
+    def start!
+      PipelineStatus.start!(@pipeline_name)
+      Sidekiq.logger.info "🚀 Pipeline #{pipeline_name} started" if Sidekiq.logger
+    end
+
     def finish!(success: true, error: nil)
-      # Статус теперь определяется динамически, ничего не делаем
       new_status = success ? 'completed' : 'failed'
-      Sidekiq.logger.info "#{success ? '✅' : '❌'} Pipeline #{pipeline_name} finished with status: #{new_status}"
+      PipelineStatus.finish!(@pipeline_name, success: success)
+      Sidekiq.logger.info "#{success ? '✅' : '❌'} Pipeline #{pipeline_name} finished with status: #{new_status}" if Sidekiq.logger
     end
 
-    # Переопределяем методы статусов - определяем их динамически на основе нод
-    # Это предотвращает зависание пайплайна в статусе running
-
-    # Проверить запущен ли пайплайн
-    # Пайплайн считается running если:
-    # 1. Есть хотя бы одна running нода ИЛИ
-    # 2. Есть задачи в очереди для данного провайдера
     def running?
-      return true if sidekiq_pipeline_nodes.where(status: :running).exists?
+      return true if PipelineStatus.running_node_ids(@pipeline_name).any?
       return true if has_jobs_in_queue?
-
       false
     end
 
-    # Проверить завершен ли пайплайн (все ноды completed или skipped, и нет running/failed)
     def completed?
-      return false if sidekiq_pipeline_nodes.empty?
-      return false if sidekiq_pipeline_nodes.where(status: %i[running pending failed]).exists?
-
-      sidekiq_pipeline_nodes.where(status: %i[completed skipped]).exists?
+      node_ids = all_node_ids
+      return false if node_ids.empty?
+      
+      statuses = PipelineStatus.all_node_statuses(@pipeline_name)
+      return false if statuses.empty?
+      
+      node_ids.all? do |node_id|
+        status = statuses[node_id]
+        status == 'completed' || status == 'skipped'
+      end
     end
 
-    # Проверить есть ли ошибки (хотя бы одна failed нода)
     def failed?
-      sidekiq_pipeline_nodes.where(status: :failed).exists?
+      PipelineStatus.all_node_statuses(@pipeline_name).values.include?('failed')
     end
 
-    # Проверить в режиме ожидания
-    # Пайплайн idle если НЕТ running нод И НЕТ задач в очереди
-    # Статус определяется динамически, не зависит от completed/failed нод
     def idle?
       !running?
     end
 
-    # Проверить запущен ли пайплайн (алиас для running?)
     def active?
       running?
     end
 
-    # Получить текущий статус как строку (для обратной совместимости)
     def status
       return 'failed' if failed?
       return 'running' if running?
       return 'completed' if completed?
-
       'idle'
     end
 
-    # Получить текущую выполняющуюся ноду
     def current_node
-      sidekiq_pipeline_nodes.running.first
+      running_nodes = PipelineStatus.running_node_ids(@pipeline_name)
+      return nil if running_nodes.empty?
+      
+      node_id = running_nodes.first
+      SidekiqPipelineNode.new(@pipeline_name, node_id)
     end
 
-    # Получить завершённые ноды
     def completed_nodes
-      sidekiq_pipeline_nodes.completed
+      statuses = PipelineStatus.all_node_statuses(@pipeline_name)
+      statuses
+        .select { |_, status| status == 'completed' || status == 'skipped' }
+        .map { |node_id, _| SidekiqPipelineNode.new(@pipeline_name, node_id) }
     end
 
-    # Получить прогресс пайплайна (процент завершённых нод)
+    def sidekiq_pipeline_nodes
+      all_node_ids.map { |node_id| SidekiqPipelineNode.new(@pipeline_name, node_id) }
+    end
+
     def progress_percent
-      total = sidekiq_pipeline_nodes.count
+      total = all_node_ids.count
       return 0 if total.zero?
 
-      completed_count = sidekiq_pipeline_nodes.completed.count
-      ((completed_count.to_f / total) * 100).round(1)
+      completed = PipelineStatus.completed_nodes_count(@pipeline_name)
+      ((completed.to_f / total) * 100).round(1)
+    end
+
+    def update!(attrs)
+      if attrs[:run_at]
+        PipelineStatus.redis.set("pipeline:#{@pipeline_name}:run_at", attrs[:run_at].iso8601)
+      end
+      if attrs[:status]
+        PipelineStatus.redis.set("pipeline:#{@pipeline_name}:status", attrs[:status].to_s)
+      end
     end
 
     private
 
-    # Определить имя очереди Sidekiq для данного провайдера
-    def queue_name
-      # Имя очереди обычно совпадает с именем провайдера
-      # Для специальных случаев можно расширить логику
-      pipeline_name
+    def all_node_ids
+      keys = PipelineStatus.redis.keys("pipeline:#{@pipeline_name}:nodes:*:status")
+      keys.map { |k| k.match(/nodes:([^:]+):status/)&.[](1) }.compact.uniq
     end
 
-    # Проверить наличие задач в очереди для данного провайдера
-    # Проверяет как pending задачи в очереди, так и выполняющиеся задачи
+    def queue_name
+      @pipeline_name
+    end
+
     def has_jobs_in_queue?
-      queue_name = self.queue_name
       return false if queue_name.blank?
 
-      # В тестовом окружении проверяем переменную класса для симуляции
-      return true if defined?(Rails) && Rails.env.test? && self.class.test_queues_with_jobs&.include?(queue_name)
+      if defined?(Rails) && Rails.env.test? && self.class.test_queues_with_jobs&.include?(queue_name)
+        return true
+      end
 
       begin
-        # Проверяем pending задачи в очереди
         queue = Sidekiq::Queue.new(queue_name)
         return true if queue.size > 0
 
-        # Проверяем выполняющиеся задачи (busy workers)
         workers = Sidekiq::Workers.new
         workers.each do |_process_id, _thread_id, work|
           return true if work['queue'] == queue_name
@@ -158,10 +147,11 @@ module Sidekiq
 
         false
       rescue StandardError => e
-        # Если очередь не существует или произошла ошибка, считаем что задач нет
-        Sidekiq.logger.debug "Queue #{queue_name} check failed: #{e.message}"
+        Sidekiq.logger.debug "Queue #{queue_name} check failed: #{e.message}" if Sidekiq.logger
         false
       end
     end
   end
 end
+
+require_relative 'pipeline_status'
