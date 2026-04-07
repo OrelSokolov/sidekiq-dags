@@ -108,6 +108,7 @@ module Sidekiq
       if respond_to?(:pipeline_name) && respond_to?(:node_name)
         pipeline_name = self.pipeline_name
         node_name = self.node_name
+        Sidekiq.logger.info "🔔 Registering PipelineCallback for #{pipeline_name}::#{node_name} (bid: #{@batch.bid})"
         @batch.on(:complete, Sidekiq::PipelineCallback, {
                     'pipeline_name' => pipeline_name,
                     'node_name' => node_name,
@@ -122,6 +123,7 @@ module Sidekiq
         # PipelineCallback сам запустит следующую ноду
       else
         # Если PipelineTracking не используется, используем стандартный callback
+        Sidekiq.logger.info "🔔 Registering standard callback for #{self.class} (no PipelineTracking)"
         @batch.on(:complete, self.class, 'single' => single_mode)
       end
       @batch.run

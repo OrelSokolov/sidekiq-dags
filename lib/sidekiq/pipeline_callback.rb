@@ -26,6 +26,10 @@ module Sidekiq
     private
 
     def handle_event(status, options, event_type)
+      Sidekiq.logger.info "🎯 PipelineCallback.handle_event called!"
+      Sidekiq.logger.info "   Event: #{event_type}"
+      Sidekiq.logger.info "   Options: #{options.inspect}"
+      
       pipeline_name = options['pipeline_name'] || options[:pipeline_name]
       node_name = options['node_name'] || options[:node_name]
       Sidekiq.logger.info "HANDLE EVENT: #{event_type} for node: #{node_name}"
