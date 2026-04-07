@@ -77,6 +77,7 @@ module Sidekiq
 
       ensure_node_record_exists!
       current_node_record.complete!
+      broadcast_status_change(pipeline_name, node_name, 'completed')
 
       current_pipeline.finish!(success: true) if node_name == 'EndNode' && current_pipeline
     rescue => e
@@ -88,6 +89,7 @@ module Sidekiq
 
       ensure_node_record_exists!
       current_node_record.fail!(error.message)
+      broadcast_status_change(pipeline_name, node_name, 'failed')
       current_pipeline.finish!(success: false, error: error.message)
     rescue => e
       Sidekiq.logger.debug "Pipeline tracking error: #{e.message}" if Sidekiq.logger
