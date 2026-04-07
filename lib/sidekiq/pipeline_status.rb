@@ -4,80 +4,94 @@ module Sidekiq
   # Внутренний класс для работы с Redis
   class PipelineStatus
     class << self
+      # Выполняет блок с Redis-соединением из пула Sidekiq
+      # Не возвращает соединение напрямую, чтобы избежать проблем с многопоточностью
       def redis
-        Sidekiq.redis { |conn| conn }
+        Sidekiq.redis { |conn| yield conn }
       end
 
       # Pipeline level
       def running?(pipeline_name)
-        redis.get("pipeline:#{pipeline_name}:status") == "running"
+        redis { |conn| conn.get("pipeline:#{pipeline_name}:status") == "running" }
       end
 
       def start!(pipeline_name)
-        redis.multi do |pipe|
-          pipe.set("pipeline:#{pipeline_name}:status", "running")
-          pipe.set("pipeline:#{pipeline_name}:run_at", Time.current.iso8601)
+        redis do |conn|
+          conn.multi do |pipe|
+            pipe.set("pipeline:#{pipeline_name}:status", "running")
+            pipe.set("pipeline:#{pipeline_name}:run_at", Time.current.iso8601)
+          end
         end
       end
 
       def finish!(pipeline_name, success: true)
-        redis.set("pipeline:#{pipeline_name}:status", success ? "completed" : "failed")
+        redis { |conn| conn.set("pipeline:#{pipeline_name}:status", success ? "completed" : "failed") }
       end
 
       def reset!(pipeline_name)
-        keys = redis.keys("pipeline:#{pipeline_name}:nodes:*")
-        redis.del(*keys) if keys.any?
-        redis.del("pipeline:#{pipeline_name}:status")
-        redis.del("pipeline:#{pipeline_name}:run_at")
+        redis do |conn|
+          keys = conn.keys("pipeline:#{pipeline_name}:nodes:*")
+          conn.del(*keys) if keys.any?
+          conn.del("pipeline:#{pipeline_name}:status")
+          conn.del("pipeline:#{pipeline_name}:run_at")
+        end
       end
 
       # Node level
       def node_status(pipeline_name, node_name)
-        redis.get("pipeline:#{pipeline_name}:nodes:#{node_name}:status") || "pending"
+        redis { |conn| conn.get("pipeline:#{pipeline_name}:nodes:#{node_name}:status") || "pending" }
       end
 
       def node_start!(pipeline_name, node_name, bid: nil)
-        redis.multi do |pipe|
-          pipe.set("pipeline:#{pipeline_name}:nodes:#{node_name}:status", "running")
-          pipe.set("pipeline:#{pipeline_name}:nodes:#{node_name}:run_at", Time.current.iso8601)
-          if bid
+        redis do |conn|
+          conn.multi do |pipe|
+            pipe.set("pipeline:#{pipeline_name}:nodes:#{node_name}:status", "running")
+            pipe.set("pipeline:#{pipeline_name}:nodes:#{node_name}:run_at", Time.current.iso8601)
+            if bid
+              pipe.set("pipeline:#{pipeline_name}:nodes:#{node_name}:bid", bid)
+              pipe.set("pipeline:bid:#{bid}", "#{pipeline_name}:#{node_name}")
+            end
+          end
+        end
+      end
+
+      def node_complete!(pipeline_name, node_name)
+        redis { |conn| conn.set("pipeline:#{pipeline_name}:nodes:#{node_name}:status", "completed") }
+      end
+
+      def node_fail!(pipeline_name, node_name, error = nil)
+        redis do |conn|
+          conn.multi do |pipe|
+            pipe.set("pipeline:#{pipeline_name}:nodes:#{node_name}:status", "failed")
+            pipe.set("pipeline:#{pipeline_name}:nodes:#{node_name}:error", error.to_s) if error
+          end
+        end
+      end
+
+      def node_bid(pipeline_name, node_name)
+        redis { |conn| conn.get("pipeline:#{pipeline_name}:nodes:#{node_name}:bid") }
+      end
+
+      def save_bid!(pipeline_name, node_name, bid)
+        return unless bid
+        redis do |conn|
+          conn.multi do |pipe|
             pipe.set("pipeline:#{pipeline_name}:nodes:#{node_name}:bid", bid)
             pipe.set("pipeline:bid:#{bid}", "#{pipeline_name}:#{node_name}")
           end
         end
       end
 
-      def node_complete!(pipeline_name, node_name)
-        redis.set("pipeline:#{pipeline_name}:nodes:#{node_name}:status", "completed")
-      end
-
-      def node_fail!(pipeline_name, node_name, error = nil)
-        redis.multi do |pipe|
-          pipe.set("pipeline:#{pipeline_name}:nodes:#{node_name}:status", "failed")
-          pipe.set("pipeline:#{pipeline_name}:nodes:#{node_name}:error", error.to_s) if error
-        end
-      end
-
-      def node_bid(pipeline_name, node_name)
-        redis.get("pipeline:#{pipeline_name}:nodes:#{node_name}:bid")
-      end
-
-      def save_bid!(pipeline_name, node_name, bid)
-        return unless bid
-        redis.multi do |pipe|
-          pipe.set("pipeline:#{pipeline_name}:nodes:#{node_name}:bid", bid)
-          pipe.set("pipeline:bid:#{bid}", "#{pipeline_name}:#{node_name}")
-        end
-      end
-
       def all_node_statuses(pipeline_name)
-        keys = redis.keys("pipeline:#{pipeline_name}:nodes:*:status")
-        return {} if keys.empty?
-        
-        values = redis.mget(*keys)
-        keys.each_with_object({}).with_index do |(key, hash), index|
-          node_name = key.match(/nodes:([^:]+):status/)&.[](1)
-          hash[node_name] = values[index] if node_name
+        redis do |conn|
+          keys = conn.keys("pipeline:#{pipeline_name}:nodes:*:status")
+          return {} if keys.empty?
+
+          values = conn.mget(*keys)
+          keys.each_with_object({}).with_index do |(key, hash), index|
+            node_name = key.match(/nodes:([^:]+):status/)&.[](1)
+            hash[node_name] = values[index] if node_name
+          end
         end
       end
 
@@ -93,24 +107,28 @@ module Sidekiq
       end
 
       def node_progress(pipeline_name, node_name)
-        data = redis.hgetall("pipeline:#{pipeline_name}:nodes:#{node_name}:progress")
-        return nil if data.empty?
-        
-        {
-          bid: data['bid'],
-          max: data['total'].to_i,
-          pending: data['pending'].to_i,
-          done: data['done'].to_i,
-          progress_percentage: data['progress_percentage'].to_f
-        }
+        redis do |conn|
+          data = conn.hgetall("pipeline:#{pipeline_name}:nodes:#{node_name}:progress")
+          return nil if data.empty?
+
+          {
+            bid: data['bid'],
+            max: data['total'].to_i,
+            pending: data['pending'].to_i,
+            done: data['done'].to_i,
+            progress_percentage: data['progress_percentage'].to_f
+          }
+        end
       end
 
       def find_node_by_bid(bid)
-        data = redis.get("pipeline:bid:#{bid}")
-        return nil unless data
-        
-        parts = data.split(":", 2)
-        { pipeline_name: parts[0], node_id: parts[1] }
+        redis do |conn|
+          data = conn.get("pipeline:bid:#{bid}")
+          return nil unless data
+
+          parts = data.split(":", 2)
+          { pipeline_name: parts[0], node_id: parts[1] }
+        end
       end
     end
   end
