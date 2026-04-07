@@ -36,9 +36,15 @@ module Sidekiq
         node_record = SidekiqPipelineNode.for(pipeline_name, node_name)
         pipeline = SidekiqPipeline.for(pipeline_name)
 
-        return unless node_record && pipeline
+        unless node_record && pipeline
+          Sidekiq.logger.warn "⚠️ Pipeline callback: node_record or pipeline not found for #{pipeline_name}::#{node_name}"
+          return
+        end
+        
+        Sidekiq.logger.info "📊 Node status from Redis: #{node_record.status}"
       rescue => e
-        Sidekiq.logger.debug "Pipeline callback error: #{e.message}"
+        Sidekiq.logger.error "Pipeline callback error: #{e.message}"
+        Sidekiq.logger.error e.backtrace.first(5).join("\n")
         return
       end
 
@@ -216,7 +222,8 @@ module Sidekiq
         Sidekiq.logger.info "Node: #{node_record.inspect}".colorize(:light_yellow)
 
         # Проверяем, что нода действительно в статусе running или pending перед завершением
-        # Если нода в pending, значит mark_node_started! не был вызван, но батч завершился - помечаем как running и затем completed
+        Sidekiq.logger.info "🔍 Checking node status: pending?=#{node_record.pending?}, running?=#{node_record.running?}, status=#{node_record.status}"
+        
         if node_record.pending?
           node_record.start!
           Sidekiq.logger.info "⚠️ Node #{pipeline_name}::#{node_name} was pending, marking as running"
