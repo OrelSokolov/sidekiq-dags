@@ -32,16 +32,13 @@ module Sidekiq
 
       return unless pipeline_name && node_name
 
-      # Проверяем доступность БД перед использованием моделей
-      return unless defined?(ActiveRecord) && ActiveRecord::Base.connected?
-
       begin
         node_record = SidekiqPipelineNode.for(pipeline_name, node_name)
         pipeline = SidekiqPipeline.for(pipeline_name)
 
         return unless node_record && pipeline
-      rescue ::ActiveRecord::ConnectionNotDefined, ::ActiveRecord::NoDatabaseError => e
-        Sidekiq.logger.debug "Pipeline tracking disabled: #{e.message}"
+      rescue => e
+        Sidekiq.logger.debug "Pipeline callback error: #{e.message}"
         return
       end
 
