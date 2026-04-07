@@ -92,6 +92,19 @@ module Sidekiq
           .count { |_, status| %w[completed skipped].include?(status) }
       end
 
+      def node_progress(pipeline_name, node_name)
+        data = redis.hgetall("pipeline:#{pipeline_name}:nodes:#{node_name}:progress")
+        return nil if data.empty?
+        
+        {
+          bid: data['bid'],
+          max: data['total'].to_i,
+          pending: data['pending'].to_i,
+          done: data['done'].to_i,
+          progress_percentage: data['progress_percentage'].to_f
+        }
+      end
+
       def find_node_by_bid(bid)
         data = redis.get("pipeline:bid:#{bid}")
         return nil unless data
