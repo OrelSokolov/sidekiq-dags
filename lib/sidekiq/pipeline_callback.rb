@@ -189,7 +189,9 @@ module Sidekiq
         node_record.reload
 
         node_record.fail!(error_msg)
+        broadcast_status_change(pipeline_name, node_name, 'failed')
         pipeline.finish!(success: false, error: error_msg)
+        broadcast_pipeline_status(pipeline_name, false)
         Sidekiq.logger.error "❌ Node #{pipeline_name}::#{node_name} failed via batch failure event (bid: #{status.bid}): #{error_msg}"
 
       when 'complete'
@@ -229,6 +231,7 @@ module Sidekiq
           Sidekiq.logger.info "⚠️ Batch complete event ignored - node already #{node_record.status}"
         else
           node_record.complete!
+          broadcast_status_change(pipeline_name, node_name, 'completed')
           Sidekiq.logger.info "✅ Node #{pipeline_name}::#{node_name} completed via batch complete event (bid: #{status.bid})"
 
           single_mode = options['single'] || options[:single]
@@ -237,6 +240,7 @@ module Sidekiq
             Sidekiq.logger.info "🔶 Single mode - skipping next_node for #{pipeline_name}::#{node_name}"
           elsif node_name == 'EndNode'
             pipeline.finish!(success: true)
+            broadcast_pipeline_status(pipeline_name, false)
             Sidekiq.logger.info "🏁 Pipeline #{pipeline_name} finished successfully"
           else
             trigger_next_node(pipeline_name, node_name)
@@ -328,6 +332,32 @@ module Sidekiq
       end
 
       nil
+    end
+
+    # Broadcast статуса ноды через ActionCable (если доступно)
+    def broadcast_status_change(pipeline_name, node_name, status)
+      # Проверяем наличие PipelineBroadcastService в Rails приложении
+      if defined?(PipelineBroadcastService)
+        begin
+          PipelineBroadcastService.broadcast_node_progress(pipeline_name, node_name, status, nil)
+          Sidekiq.logger.debug "📡 Broadcasted status change for #{pipeline_name}/#{node_name}: #{status}"
+        rescue => e
+          Sidekiq.logger.debug "Failed to broadcast status change: #{e.message}"
+        end
+      end
+    end
+
+    # Broadcast статуса пайплайна через ActionCable (если доступно)
+    def broadcast_pipeline_status(pipeline_name, is_running)
+      # Проверяем наличие PipelineBroadcastService в Rails приложении
+      if defined?(PipelineBroadcastService)
+        begin
+          PipelineBroadcastService.broadcast_pipeline_status(pipeline_name, is_running)
+          Sidekiq.logger.debug "📡 Broadcasted pipeline status for #{pipeline_name}: running=#{is_running}"
+        rescue => e
+          Sidekiq.logger.debug "Failed to broadcast pipeline status: #{e.message}"
+        end
+      end
     end
   end
 end

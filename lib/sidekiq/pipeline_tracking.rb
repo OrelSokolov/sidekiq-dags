@@ -64,6 +64,7 @@ module Sidekiq
       end
 
       current_node_record.start!
+      broadcast_status_change(pipeline_name, node_name, 'running')
       true
     rescue => e
       Sidekiq.logger.debug "Pipeline tracking error: #{e.message}" if Sidekiq.logger
@@ -108,6 +109,21 @@ module Sidekiq
           statuses
             .select { |_, status| %w[running completed].include?(status) }
             .map { |node_id, _| "#{name}_#{node_id}" }
+        end
+      end
+    end
+
+    private
+
+    # Broadcast статуса ноды через ActionCable (если доступно)
+    def broadcast_status_change(pipeline_name, node_name, status)
+      # Проверяем наличие PipelineBroadcastService в Rails приложении
+      if defined?(PipelineBroadcastService)
+        begin
+          PipelineBroadcastService.broadcast_node_progress(pipeline_name, node_name, status, nil)
+          Sidekiq.logger.debug "📡 Broadcasted status change for #{pipeline_name}/#{node_name}: #{status}" if Sidekiq.logger
+        rescue => e
+          Sidekiq.logger.debug "Failed to broadcast status change: #{e.message}" if Sidekiq.logger
         end
       end
     end
