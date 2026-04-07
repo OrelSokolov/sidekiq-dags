@@ -5,6 +5,12 @@ module Sidekiq
   class SidekiqPipelineNode
     attr_reader :pipeline_name, :node_name
 
+    # Clear all node data from Redis (for test cleanup)
+    def self.destroy_all
+      # Nodes are cleared when pipeline.destroy_all is called
+      # This method exists for API compatibility with ActiveRecord
+    end
+
     def self.for(pipeline_name, node_name)
       pipeline = SidekiqPipeline.for(pipeline_name)
       return nil unless pipeline

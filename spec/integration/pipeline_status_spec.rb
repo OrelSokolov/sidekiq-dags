@@ -1,9 +1,6 @@
-# frozen_string_literal: true
-
 require 'spec_helper'
 require 'sidekiq/batch'
 require 'sidekiq/testing'
-require_relative '../support/database'
 
 # Добавляем метод present? для совместимости с Node
 class String
@@ -34,100 +31,52 @@ Sidekiq::Testing.server_middleware do |chain|
   chain.add Sidekiq::Batch::Middleware::ServerMiddleware
 end
 
-# Тест цепочки из 100 нод с проверкой статусов в моделях
-# Цепочка: PipelineStatusNode1 -> PipelineStatusNode2 -> ... -> PipelineStatusNode100
-
 # Массив для хранения номеров нод, у которых был вызван коллбэк
 $pipeline_status_callbacks_runs = []
 
 # DummyJob для создания непустого батча
-class PipelineStatusDummyJob
+class DummyJob
   include Sidekiq::Worker
 
-  def perform(desc)
+  def perform(desc = 'dummy')
     # Пустой джоб
   end
 end
 
-# Создаем модуль для пайплайна с использованием PipelineTracking
+# Создаем тестовый модуль и 100 нод
 module TestPipeline
   extend Sidekiq::NodeDsl
 
-  # Создаем 100 нод в цепочке с PipelineTracking
-  (1..100).each do |i|
-    node_class = Class.new(Sidekiq::Node) do
-      include Sidekiq::PipelineTracking
+  class BaseNode < Sidekiq::Node
+    include Sidekiq::PipelineTracking
+    sidekiq_options queue: 'test_pipeline'
 
-      desc "PipelineStatusNode#{i}"
+    # Переопределяем perform для отслеживания вызовов
+    def perform(*args, **kwargs)
+      # Добавляем номер ноды в глобальный массив
+      node_number = self.class.name.match(/PipelineStatusNode(\d+)/)[1].to_i
+      $pipeline_status_callbacks_runs << node_number
 
-      # Переопределяем perform для использования DummyJob
-      def perform(*args, **kwargs)
-        observer
-
-        # Отслеживание начала ноды (если включен PipelineTracking)
-        if respond_to?(:mark_node_started!)
-          started = mark_node_started!
-          return unless started # Если пайплайн уже запущен, не запускаем ноду
-        end
-
-        @batch = Sidekiq::Batch.new
-
-        @batch.add_jobs do
-          PipelineStatusDummyJob.perform_async(desc)
-          execute(*args, **kwargs)
-        end
-
-        # Регистрируем callback для отслеживания статусов пайплайна
-        if respond_to?(:pipeline_name) && respond_to?(:node_name)
-          pipeline_name = self.pipeline_name
-          node_name = self.node_name
-          @batch.on(:complete, Sidekiq::PipelineCallback, {
-                      'pipeline_name' => pipeline_name,
-                      'node_name' => node_name
-                    })
-          @batch.on(:failure, Sidekiq::PipelineCallback, {
-                      'pipeline_name' => pipeline_name,
-                      'node_name' => node_name
-                    })
-        end
-
-        @batch.on(:complete, self.class)
-        @batch.run
-
-        s = Sidekiq::Batch::ExplicitStatus.new(@batch.bid)
-        notify_all "➡️ #{desc.present? ? desc : self.class} -> (#{s.total})    | #{@batch.bid}"
-      end
-
-      # Коллбэк, который добавляет номер ноды в массив
-      # НЕ вызываем super, так как PipelineCallback уже запустит следующую ноду
-      def on_complete(_status, _options)
-        node_number = self.class.name.match(/PipelineStatusNode(\d+)/)[1].to_i
-        $pipeline_status_callbacks_runs << node_number
-        # super не вызываем - PipelineCallback обработает запуск следующей ноды
-      end
-
-      private
-
-      def notify_all(msg)
-        prefix = "[#{sidekiq_queue}] "
-        Sidekiq.logger.info (prefix + msg).colorize(:blue) if defined?(colorize)
-        Sidekiq.logger.info(prefix + msg) unless defined?(colorize)
-      end
-
-      def sidekiq_queue
-        self.class.get_sidekiq_options['queue'] || 'default'
-      end
+      # Вызываем оригинальный perform
+      super(*args, **kwargs)
     end
-
-    TestPipeline.const_set("PipelineStatusNode#{i}", node_class)
   end
 
-  # Устанавливаем связи между нодами (next_node)
-  (1..99).each do |i|
-    next_node_class = TestPipeline.const_get("PipelineStatusNode#{i + 1}")
-    node_class = TestPipeline.const_get("PipelineStatusNode#{i}")
-    node_class.next_node(next_node_class)
+  # Создаем 100 нод
+  (1..100).each do |i|
+    node_class = Class.new(BaseNode) do
+      desc "PipelineStatusNode#{i}"
+      execute { }
+    end
+    const_set("PipelineStatusNode#{i}", node_class)
   end
+end
+
+# Устанавливаем связи между нодами (next_node)
+(1..99).each do |i|
+  next_node_class = TestPipeline.const_get("PipelineStatusNode#{i + 1}")
+  node_class = TestPipeline.const_get("PipelineStatusNode#{i}")
+  node_class.next_node(next_node_class)
 end
 
 # Запускаем тест
@@ -136,54 +85,9 @@ describe 'Pipeline Status Test with 100 nodes' do
     $pipeline_status_callbacks_runs.clear
     Sidekiq.redis { |r| r.flushdb }
 
-    # Убеждаемся, что БД подключена и настроена
-    if defined?(ActiveRecord)
-      begin
-        # Устанавливаем подключение, если его нет
-        unless ActiveRecord::Base.connected?
-          ActiveRecord::Base.establish_connection(
-            adapter: 'sqlite3',
-            database: ':memory:'
-          )
-
-          # Создаем таблицы, если их нет
-          unless ActiveRecord::Base.connection.table_exists?('sidekiq_pipelines')
-            ActiveRecord::Schema.define do
-              create_table :sidekiq_pipelines, force: true do |t|
-                t.string :pipeline_name, null: false
-                t.integer :status, default: 0
-                t.datetime :run_at
-                t.timestamps
-              end
-
-              add_index :sidekiq_pipelines, :pipeline_name, unique: true
-              add_index :sidekiq_pipelines, :status
-
-              create_table :sidekiq_pipeline_nodes, force: true do |t|
-                t.references :sidekiq_pipeline, null: false, foreign_key: false
-                t.string :node_name, null: false
-                t.integer :status, default: 0, null: false
-                t.datetime :run_at
-                t.text :error_message
-                t.timestamps
-              end
-
-              add_index :sidekiq_pipeline_nodes, %i[sidekiq_pipeline_id node_name], unique: true,
-                                                                                    name: 'index_sidekiq_pipeline_nodes_on_pipeline_and_node'
-              add_index :sidekiq_pipeline_nodes, :sidekiq_pipeline_id
-              add_index :sidekiq_pipeline_nodes, :status
-            end
-          end
-        end
-
-        # Очищаем данные из БД
-        if defined?(Sidekiq::SidekiqPipeline) && Sidekiq::SidekiqPipeline.table_exists?
-          Sidekiq::SidekiqPipelineNode.delete_all
-          Sidekiq::SidekiqPipeline.delete_all
-        end
-      rescue StandardError => e
-        puts "Warning: Database setup error: #{e.message}" if ENV['DEBUG']
-      end
+    # Очищаем данные из Redis
+    if defined?(Sidekiq::SidekiqPipeline)
+      Sidekiq::SidekiqPipeline.destroy_all
     end
   end
 
@@ -215,65 +119,40 @@ describe 'Pipeline Status Test with 100 nodes' do
     expect($pipeline_status_callbacks_runs.sort).to eq(expected),
                                                     'Callbacks were not called in correct order or some are missing'
 
-    # Проверяем статусы в моделях
-    database_available = begin
-      defined?(ActiveRecord) &&
-        ActiveRecord::Base.connected? &&
-        defined?(Sidekiq::SidekiqPipeline) &&
-        Sidekiq::SidekiqPipeline.table_exists?
-    rescue StandardError
-      false
-    end
+    # Проверяем статусы в Redis
+    pipeline = Sidekiq::SidekiqPipeline.for('test_pipeline')
 
-    if database_available
-      pipeline = Sidekiq::SidekiqPipeline.for('test_pipeline')
+    expect(pipeline).not_to be_nil
 
-      expect(pipeline).not_to be_nil
+    # Проверяем, что все ноды завершились со статусом completed
+    pipeline_nodes = pipeline.sidekiq_pipeline_nodes
+    node_statuses = pipeline_nodes.map(&:status)
 
-      # Проверяем, что все ноды завершились со статусом completed
-      pipeline_nodes = pipeline.sidekiq_pipeline_nodes
-      node_statuses = pipeline_nodes.pluck(:status)
+    puts "Total pipeline nodes: #{pipeline_nodes.count}"
+    puts "Node statuses: #{node_statuses.inspect}"
 
-      puts "Total pipeline nodes: #{pipeline_nodes.count}"
-      puts "Node statuses: #{node_statuses.inspect}"
+    # Проверяем, что все статусы равны 'completed'
+    all_completed = pipeline_nodes.all? { |node| node.status == 'completed' }
 
-      # Проверяем, что все статусы равны :completed
-      # Используем символы для проверки через enum
-      all_completed = pipeline_nodes.all? { |node| node.status == 'completed' }
+    expect(pipeline_nodes.count).to eq(100)
+    expect(all_completed).to be(true), "Not all nodes are completed. Statuses: #{pipeline_nodes.map do |n|
+      "#{n.node_name}:#{n.status}"
+    end.inspect}"
 
-      expect(pipeline_nodes.count).to eq(100)
-      expect(all_completed).to be(true), "Not all nodes are completed. Statuses: #{pipeline_nodes.map do |n|
-        "#{n.node_name}:#{n.status}"
-      end.inspect}"
+    # Альтернативная проверка через символы
+    all_completed_symbols_check = pipeline_nodes.all? { |node| node.status.to_sym == :completed }
+    expect(all_completed_symbols_check).to be(true), 'Not all nodes have :completed status (symbol check)'
 
-      # Проверка через pluck (как в запросе пользователя)
-      # Pipeline.for('test_pipeline').pipeline_nodes.pluck(:status).all?{|x| x == :completed }
-      # Примечание: pluck возвращает строки для enum, поэтому сравниваем со строкой "completed"
-      statuses = pipeline.sidekiq_pipeline_nodes.pluck(:status)
-      all_completed_by_pluck = statuses.all? { |x| x == 'completed' || x.to_s == 'completed' }
-      expect(all_completed_by_pluck).to be(true), "Not all nodes are completed by pluck. Statuses: #{statuses.inspect}"
+    # Проверяем статус пайплайна
+    expect(pipeline.completed?).to be(true)
+    expect(pipeline.failed?).to be(false)
+    expect(pipeline.running?).to be(false)
 
-      # Альтернативная проверка через символы (если нужно сравнивать с :completed)
-      # Для этого нужно сначала получить статусы как символы через map
-      all_completed_symbols_check = pipeline.sidekiq_pipeline_nodes.map do |node|
-        node.status.to_sym
-      end.all? { |x| x == :completed }
-      expect(all_completed_symbols_check).to be(true), 'Not all nodes have :completed status (symbol check)'
+    # Проверяем прогресс
+    expect(pipeline.progress_percent).to eq(100.0)
 
-      # Проверяем статус пайплайна
-      expect(pipeline.completed?).to be(true)
-      expect(pipeline.failed?).to be(false)
-      expect(pipeline.running?).to be(false)
-
-      # Проверяем прогресс
-      expect(pipeline.progress_percent).to eq(100.0)
-
-      puts '✅ All 100 nodes completed successfully'
-      puts "✅ Pipeline status: #{pipeline.status}"
-      puts "✅ Pipeline progress: #{pipeline.progress_percent}%"
-    else
-      puts '⚠️ Pipeline tracking not available (ActiveRecord not configured)'
-      skip 'Pipeline tracking requires ActiveRecord and database setup'
-    end
+    puts '✅ All 100 nodes completed successfully'
+    puts "✅ Pipeline status: #{pipeline.status}"
+    puts "✅ Pipeline progress: #{pipeline.progress_percent}%"
   end
 end

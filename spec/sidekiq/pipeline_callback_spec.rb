@@ -421,12 +421,6 @@ describe Sidekiq::PipelineCallback do
   # =============================================================================
   describe 'race condition detection with failures' do
     before(:each) do
-      # Проверяем доступность БД
-      unless defined?(ActiveRecord) && ActiveRecord::Base.connected? && 
-             Sidekiq::SidekiqPipeline.table_exists?
-        skip "Pipeline tracking requires ActiveRecord and database setup"
-      end
-      
       # Создаем тестовый пайплайн и ноду
       @pipeline = Sidekiq::SidekiqPipeline.for('alpha')
       @node = Sidekiq::SidekiqPipelineNode.for('alpha', 'RootNode')
@@ -434,10 +428,8 @@ describe Sidekiq::PipelineCallback do
     end
     
     after(:each) do
-      if defined?(ActiveRecord) && ActiveRecord::Base.connected?
-        Sidekiq::SidekiqPipelineNode.destroy_all
-        Sidekiq::SidekiqPipeline.destroy_all
-      end
+      Sidekiq::SidekiqPipelineNode.destroy_all
+      Sidekiq::SidekiqPipeline.destroy_all
     end
     
     it 'does NOT raise error when pending == failures (normal situation)' do
@@ -590,12 +582,6 @@ describe Sidekiq::PipelineCallback do
   # =============================================================================
   describe 'single mode' do
     before(:each) do
-      # Проверяем доступность БД
-      unless defined?(ActiveRecord) && ActiveRecord::Base.connected? &&
-             Sidekiq::SidekiqPipeline.table_exists?
-        skip "Pipeline tracking requires ActiveRecord and database setup"
-      end
-
       # Создаем тестовый пайплайн и ноду
       @pipeline = Sidekiq::SidekiqPipeline.for('alpha')
       @node = Sidekiq::SidekiqPipelineNode.for('alpha', 'RootNode')
@@ -607,10 +593,8 @@ describe Sidekiq::PipelineCallback do
 
     after(:each) do
       Sidekiq::Worker.clear_all
-      if defined?(ActiveRecord) && ActiveRecord::Base.connected?
-        Sidekiq::SidekiqPipelineNode.destroy_all
-        Sidekiq::SidekiqPipeline.destroy_all
-      end
+      Sidekiq::SidekiqPipelineNode.destroy_all
+      Sidekiq::SidekiqPipeline.destroy_all
     end
 
     it 'does NOT trigger next_node when single mode is enabled' do

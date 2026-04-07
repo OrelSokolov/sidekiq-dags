@@ -10,6 +10,14 @@ module Sidekiq
     class << self
       attr_accessor :test_queues_with_jobs
 
+      # Clear all pipeline data from Redis (for test cleanup)
+      def destroy_all
+        Sidekiq.redis do |conn|
+          keys = conn.keys("pipeline:*")
+          conn.del(*keys) if keys.any?
+        end
+      end
+
       def for(name)
         pipeline_name = underscore(name.to_s)
         puts "Create pipeline for #{name}: #{pipeline_name}".colorize(:red) if defined?(Colorize)

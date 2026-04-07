@@ -4,7 +4,7 @@ require_relative '../spec_helper'
 require 'sidekiq/testing'
 
 Sidekiq::Testing.server_middleware do |chain|
-  chain.add Sidekiq::Batch::Middleware
+  chain.add Sidekiq::Batch::Middleware::ServerMiddleware
 end
 
 # Добавляем метод present? для совместимости с Node

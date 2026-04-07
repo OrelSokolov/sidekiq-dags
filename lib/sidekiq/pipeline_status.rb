@@ -7,7 +7,25 @@ module Sidekiq
       # Выполняет блок с Redis-соединением из пула Sidekiq
       # Не возвращает соединение напрямую, чтобы избежать проблем с многопоточностью
       def redis
-        Sidekiq.redis { |conn| yield conn }
+        if block_given?
+          Sidekiq.redis { |conn| yield conn }
+        else
+          # Возвращаем объект, который делегирует вызовы в блоке
+          RedisDelegator.new
+        end
+      end
+
+      # Внутренний класс для делегирования вызовов Redis в блок
+      class RedisDelegator
+        def method_missing(method_name, *args, &block)
+          Sidekiq.redis do |conn|
+            conn.public_send(method_name, *args, &block)
+          end
+        end
+
+        def respond_to_missing?(method_name, include_private = false)
+          Sidekiq.redis { |conn| conn.respond_to?(method_name, include_private) }
+        end
       end
 
       # Pipeline level
