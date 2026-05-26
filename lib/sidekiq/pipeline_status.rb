@@ -51,7 +51,7 @@ module Sidekiq
           keys = conn.keys("pipeline:#{pipeline_name}:nodes:*")
           conn.del(*keys) if keys.any?
           conn.del("pipeline:#{pipeline_name}:status")
-          conn.del("pipeline:#{pipeline_name}:run_at")
+          # conn.del("pipeline:#{pipeline_name}:run_at") # оставляем время последнего запуска
         end
       end
 
